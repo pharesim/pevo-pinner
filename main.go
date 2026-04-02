@@ -31,7 +31,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("initializing discovery: %v", err)
 	}
-	discovery.Start(ctx)
+
+	// Auto-pin rules
+	autopin, err := NewAutoPinManager(cfg.DataDir)
+	if err != nil {
+		log.Fatalf("initializing autopin: %v", err)
+	}
 
 	// Create IPFS backend
 	var backend IPFSBackend
@@ -47,8 +52,33 @@ func main() {
 		log.Printf("using Pinata backend")
 	}
 
+	// Wire auto-pin: after each discovery refresh, pin CIDs matching rules
+	discovery.SetOnRefresh(func(items []DiscoveredItem) {
+		cids := autopin.MatchingCIDs(items)
+		if len(cids) == 0 {
+			return
+		}
+		pinned := 0
+		for _, cid := range cids {
+			already, _ := backend.IsPinned(ctx, cid)
+			if already {
+				continue
+			}
+			if err := backend.Pin(ctx, cid); err != nil {
+				log.Printf("[autopin] failed to pin %s: %v", cid, err)
+			} else {
+				pinned++
+			}
+		}
+		if pinned > 0 {
+			log.Printf("[autopin] pinned %d new CIDs (%d matched rules)", pinned, len(cids))
+		}
+	})
+
+	discovery.Start(ctx)
+
 	// Start management server
-	srv := NewServer(discovery, backend, cfg.RefreshInterval)
+	srv := NewServer(discovery, backend, autopin, cfg.RefreshInterval)
 	httpServer := &http.Server{
 		Addr:              ":" + cfg.Port,
 		Handler:           srv,

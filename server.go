@@ -38,16 +38,18 @@ type StatusResponse struct {
 type Server struct {
 	discovery *Discovery
 	backend   IPFSBackend
+	autopin   *AutoPinManager
 	startTime time.Time
 	refresh   time.Duration
 	mux       *http.ServeMux
 }
 
 // NewServer creates the HTTP server with all routes.
-func NewServer(discovery *Discovery, backend IPFSBackend, refreshInterval time.Duration) *Server {
+func NewServer(discovery *Discovery, backend IPFSBackend, autopin *AutoPinManager, refreshInterval time.Duration) *Server {
 	s := &Server{
 		discovery: discovery,
 		backend:   backend,
+		autopin:   autopin,
 		startTime: time.Now(),
 		refresh:   refreshInterval,
 		mux:       http.NewServeMux(),
@@ -59,6 +61,15 @@ func NewServer(discovery *Discovery, backend IPFSBackend, refreshInterval time.D
 	s.mux.HandleFunc("POST /api/unpin/{cid}", s.handleUnpin)
 	s.mux.HandleFunc("POST /api/pin-all", s.handlePinAll)
 	s.mux.HandleFunc("GET /api/status", s.handleStatus)
+
+	// Auto-pin rules
+	s.mux.HandleFunc("GET /api/autopin/rules", s.handleGetRules)
+	s.mux.HandleFunc("POST /api/autopin/rules", s.handleAddRule)
+	s.mux.HandleFunc("PUT /api/autopin/rules/{id}", s.handleUpdateRule)
+	s.mux.HandleFunc("DELETE /api/autopin/rules/{id}", s.handleDeleteRule)
+	s.mux.HandleFunc("POST /api/autopin/enable-all", s.handleEnableAllRules)
+	s.mux.HandleFunc("POST /api/autopin/disable-all", s.handleDisableAllRules)
+	s.mux.HandleFunc("POST /api/autopin/evaluate", s.handleEvaluateRules)
 
 	// IPFS gateway proxy (for embedded mode)
 	s.mux.HandleFunc("GET /ipfs/", s.handleIPFSProxy)
@@ -200,6 +211,88 @@ func (s *Server) handleIPFSProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	embedded.handleGateway(w, r)
+}
+
+func (s *Server) handleGetRules(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.autopin.Rules())
+}
+
+func (s *Server) handleAddRule(w http.ResponseWriter, r *http.Request) {
+	var rule AutoPinRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	created, err := s.autopin.AddRule(rule)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, created)
+}
+
+func (s *Server) handleUpdateRule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var rule AutoPinRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	updated, err := s.autopin.UpdateRule(id, rule)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, updated)
+}
+
+func (s *Server) handleDeleteRule(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.autopin.DeleteRule(id); err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleEnableAllRules(w http.ResponseWriter, r *http.Request) {
+	if err := s.autopin.SetAllEnabled(true); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, s.autopin.Rules())
+}
+
+func (s *Server) handleDisableAllRules(w http.ResponseWriter, r *http.Request) {
+	if err := s.autopin.SetAllEnabled(false); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, s.autopin.Rules())
+}
+
+func (s *Server) handleEvaluateRules(w http.ResponseWriter, r *http.Request) {
+	items := s.discovery.Items()
+	cids := s.autopin.MatchingCIDs(items)
+	ctx := r.Context()
+
+	pinned := 0
+	failed := 0
+	for _, cid := range cids {
+		already, _ := s.backend.IsPinned(ctx, cid)
+		if already {
+			continue
+		}
+		if err := s.backend.Pin(ctx, cid); err != nil {
+			log.Printf("[autopin] failed to pin %s: %v", cid, err)
+			failed++
+		} else {
+			pinned++
+		}
+	}
+
+	writeJSON(w, map[string]int{"matched": len(cids), "pinned": pinned, "failed": failed})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

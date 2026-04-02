@@ -13,9 +13,30 @@ document.addEventListener('alpine:init', () => {
     _refreshSeconds: 0,
     _countdownTimer: null,
 
+    // Tab state
+    tab: 'papers',
+
+    // Auto-pin rules
+    rules: [],
+    rulesLoading: false,
+    showRuleForm: false,
+    editingRule: null,
+    evaluateResult: '',
+    ruleForm: {
+      name: '',
+      disciplines: '',
+      authors: '',
+      cid_types: [],
+      title_pattern: '',
+      created_after: '',
+      created_before: '',
+      enabled: true
+    },
+
     async init() {
       await this.fetchPapers();
       await this.fetchStatus();
+      await this.fetchRules();
       this.loading = false;
       this._startCountdown();
     },
@@ -146,7 +167,6 @@ document.addEventListener('alpine:init', () => {
 
     copyToClipboard(text) {
       navigator.clipboard.writeText(text).catch(() => {
-        // Fallback
         const el = document.createElement('textarea');
         el.value = text;
         document.body.appendChild(el);
@@ -154,6 +174,160 @@ document.addEventListener('alpine:init', () => {
         document.execCommand('copy');
         document.body.removeChild(el);
       });
+    },
+
+    // --- Auto-pin rules ---
+
+    async fetchRules() {
+      this.rulesLoading = true;
+      try {
+        const resp = await fetch('/api/autopin/rules');
+        this.rules = await resp.json();
+      } catch (e) {
+        console.error('Failed to fetch rules:', e);
+      } finally {
+        this.rulesLoading = false;
+      }
+    },
+
+    resetRuleForm() {
+      this.ruleForm = {
+        name: '',
+        disciplines: '',
+        authors: '',
+        cid_types: [],
+        title_pattern: '',
+        created_after: '',
+        created_before: '',
+        enabled: true
+      };
+    },
+
+    editRule(rule) {
+      this.editingRule = rule;
+      this.ruleForm = {
+        name: rule.name || '',
+        disciplines: (rule.disciplines || []).join(', '),
+        authors: (rule.authors || []).join(', '),
+        cid_types: [...(rule.cid_types || [])],
+        title_pattern: rule.title_pattern || '',
+        created_after: rule.created_after || '',
+        created_before: rule.created_before || '',
+        enabled: rule.enabled
+      };
+      this.showRuleForm = true;
+    },
+
+    _buildRulePayload() {
+      return {
+        name: this.ruleForm.name.trim(),
+        enabled: this.ruleForm.enabled,
+        disciplines: this.ruleForm.disciplines ? this.ruleForm.disciplines.split(',').map(s => s.trim()).filter(Boolean) : [],
+        authors: this.ruleForm.authors ? this.ruleForm.authors.split(',').map(s => s.trim()).filter(Boolean) : [],
+        cid_types: this.ruleForm.cid_types,
+        title_pattern: this.ruleForm.title_pattern.trim(),
+        created_after: this.ruleForm.created_after,
+        created_before: this.ruleForm.created_before
+      };
+    },
+
+    async saveRule() {
+      const payload = this._buildRulePayload();
+      if (!payload.name) {
+        alert('Rule name is required');
+        return;
+      }
+      try {
+        let resp;
+        if (this.editingRule) {
+          resp = await fetch(`/api/autopin/rules/${this.editingRule.id}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+        } else {
+          resp = await fetch('/api/autopin/rules', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+        }
+        if (!resp.ok) {
+          const err = await resp.text();
+          alert(`Failed to save rule: ${err}`);
+          return;
+        }
+        this.showRuleForm = false;
+        this.editingRule = null;
+        await this.fetchRules();
+      } catch (e) {
+        alert(`Error saving rule: ${e.message}`);
+      }
+    },
+
+    async deleteRule(rule) {
+      if (!confirm(`Delete rule "${rule.name}"?`)) return;
+      try {
+        const resp = await fetch(`/api/autopin/rules/${rule.id}`, { method: 'DELETE' });
+        if (!resp.ok) {
+          alert('Failed to delete rule');
+          return;
+        }
+        await this.fetchRules();
+      } catch (e) {
+        alert(`Error deleting rule: ${e.message}`);
+      }
+    },
+
+    async toggleRuleEnabled(rule) {
+      const payload = { ...rule, enabled: !rule.enabled };
+      try {
+        const resp = await fetch(`/api/autopin/rules/${rule.id}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (resp.ok) {
+          await this.fetchRules();
+        }
+      } catch (e) {
+        alert(`Error toggling rule: ${e.message}`);
+      }
+    },
+
+    async enableAllRules() {
+      try {
+        const resp = await fetch('/api/autopin/enable-all', { method: 'POST' });
+        if (resp.ok) this.rules = await resp.json();
+      } catch (e) {
+        alert(`Error: ${e.message}`);
+      }
+    },
+
+    async disableAllRules() {
+      try {
+        const resp = await fetch('/api/autopin/disable-all', { method: 'POST' });
+        if (resp.ok) this.rules = await resp.json();
+      } catch (e) {
+        alert(`Error: ${e.message}`);
+      }
+    },
+
+    async evaluateRules() {
+      this.evaluateResult = '';
+      this.rulesLoading = true;
+      try {
+        const resp = await fetch('/api/autopin/evaluate', { method: 'POST' });
+        const data = await resp.json();
+        this.evaluateResult = `Matched ${data.matched} CIDs, pinned ${data.pinned} new` + (data.failed > 0 ? `, ${data.failed} failed` : '');
+        await this.fetchPapers();
+        await this.fetchStatus();
+      } catch (e) {
+        this.evaluateResult = `Evaluation failed: ${e.message}`;
+      } finally {
+        this.rulesLoading = false;
+        setTimeout(() => { this.evaluateResult = ''; }, 5000);
+      }
     }
   }));
 });

@@ -248,6 +248,201 @@ header h1 {
   color: var(--text-secondary);
 }
 
+/* Tabs */
+.tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 2px solid var(--border);
+  margin-bottom: 1rem;
+}
+
+.tab {
+  padding: 0.6rem 1.2rem;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -2px;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* Rules */
+.rules-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 1rem;
+  margin-bottom: 1rem;
+}
+
+.rules-description {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  max-width: 600px;
+}
+
+.rules-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.eval-result {
+  background: var(--bg-secondary);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  padding: 0.6rem 1rem;
+  margin-bottom: 1rem;
+  font-size: 0.85rem;
+  color: var(--accent);
+}
+
+.rules-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.rule-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1rem;
+}
+
+.rule-card.rule-disabled {
+  opacity: 0.6;
+}
+
+.rule-card-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+.rule-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  margin-bottom: 0.75rem;
+}
+
+.filter-tag {
+  display: inline-block;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+}
+
+.rule-card-actions {
+  display: flex;
+  gap: 0.4rem;
+}
+
+.btn-edit {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.btn-edit:hover {
+  background: var(--border);
+}
+
+.btn-cancel {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+.btn-cancel:hover {
+  background: var(--border);
+}
+
+/* Rule form */
+.rule-form-card {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+}
+
+.rule-form-card h3 {
+  font-size: 1rem;
+  margin-bottom: 0.75rem;
+}
+
+.rule-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.rule-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+.rule-form .hint {
+  font-weight: 400;
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+}
+
+.checkbox-group {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.checkbox-group label {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.35rem;
+  font-weight: 400;
+}
+
+.date-row {
+  display: flex;
+  gap: 0.75rem;
+}
+
+.date-row label {
+  flex: 1;
+}
+
+.toggle-label {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 0.5rem !important;
+}
+
+.rule-form-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
 @media (max-width: 768px) {
   .controls {
     flex-direction: column;
@@ -261,5 +456,11 @@ header h1 {
   }
   .papers-table {
     font-size: 0.8rem;
+  }
+  .rules-header {
+    flex-direction: column;
+  }
+  .date-row {
+    flex-direction: column;
   }
 }

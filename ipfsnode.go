@@ -28,11 +28,11 @@ type EmbeddedNode struct {
 	dataDir     string
 	gatewayPort string
 
-	mu       sync.RWMutex
-	pins     map[string]bool // CID -> pinned
-	pinFile  string
-	server   *http.Server
-	client   *http.Client
+	mu      sync.RWMutex
+	pins    map[string]bool // CID -> pinned
+	pinFile string
+	server  *http.Server
+	client  *http.Client
 }
 
 // NewEmbeddedNode creates an embedded IPFS node with local storage.

@@ -44,6 +44,14 @@
       <span x-show="status.next_refresh">| Next refresh in <span x-text="status.next_refresh"></span></span>
     </div>
 
+    <!-- Tab navigation -->
+    <div class="tabs">
+      <button class="tab" :class="{ active: tab === 'papers' }" @click="tab = 'papers'">Papers</button>
+      <button class="tab" :class="{ active: tab === 'rules' }" @click="tab = 'rules'">Auto-Pin Rules</button>
+    </div>
+
+    <!-- Papers tab -->
+    <div x-show="tab === 'papers'">
     <div class="controls">
       <input type="text" x-model="search" placeholder="Search title or author..." class="search-input">
       <select x-model="disciplineFilter" class="filter-select">
@@ -105,6 +113,106 @@
     <div x-show="!loading && filteredPapers.length === 0" class="empty">
       No papers found.
     </div>
+    </div><!-- end papers tab -->
+
+    <!-- Auto-Pin Rules tab -->
+    <div x-show="tab === 'rules'">
+      <div class="rules-header">
+        <p class="rules-description">Rules automatically pin matching CIDs after each discovery refresh. All non-empty filters within a rule must match (AND). Any matching enabled rule triggers a pin.</p>
+        <div class="rules-actions">
+          <button @click="enableAllRules()" class="btn btn-pin" :disabled="rulesLoading || rules.length === 0">Enable All</button>
+          <button @click="disableAllRules()" class="btn btn-unpin" :disabled="rulesLoading || rules.length === 0">Disable All</button>
+          <button @click="evaluateRules()" class="btn btn-pin" :disabled="rulesLoading">Evaluate Now</button>
+          <button @click="showRuleForm = true; editingRule = null; resetRuleForm()" class="btn btn-pin" :disabled="rulesLoading">Add Rule</button>
+        </div>
+      </div>
+
+      <div x-show="evaluateResult" class="eval-result" x-text="evaluateResult"></div>
+
+      <!-- Rule form (add / edit) -->
+      <div x-show="showRuleForm" class="rule-form-card">
+        <h3 x-text="editingRule ? 'Edit Rule' : 'New Rule'"></h3>
+        <div class="rule-form">
+          <label>Name
+            <input type="text" x-model="ruleForm.name" placeholder="e.g. Physics papers" class="search-input">
+          </label>
+          <label>Disciplines <span class="hint">(comma-separated, empty = all)</span>
+            <input type="text" x-model="ruleForm.disciplines" placeholder="e.g. physics, biology" class="search-input">
+          </label>
+          <label>Authors <span class="hint">(comma-separated, empty = all)</span>
+            <input type="text" x-model="ruleForm.authors" placeholder="e.g. alice, bob" class="search-input">
+          </label>
+          <label>CID Types
+            <div class="checkbox-group">
+              <label><input type="checkbox" value="paper" x-model="ruleForm.cid_types"> Papers</label>
+              <label><input type="checkbox" value="supplementary" x-model="ruleForm.cid_types"> Supplementary</label>
+              <label><input type="checkbox" value="inline_image" x-model="ruleForm.cid_types"> Inline images</label>
+            </div>
+          </label>
+          <label>Title contains <span class="hint">(case-insensitive substring)</span>
+            <input type="text" x-model="ruleForm.title_pattern" placeholder="e.g. quantum" class="search-input">
+          </label>
+          <div class="date-row">
+            <label>Created after
+              <input type="date" x-model="ruleForm.created_after" class="search-input">
+            </label>
+            <label>Created before
+              <input type="date" x-model="ruleForm.created_before" class="search-input">
+            </label>
+          </div>
+          <label class="toggle-label">
+            <input type="checkbox" x-model="ruleForm.enabled">
+            Enabled
+          </label>
+          <div class="rule-form-actions">
+            <button @click="saveRule()" class="btn btn-pin" x-text="editingRule ? 'Update' : 'Create'"></button>
+            <button @click="showRuleForm = false" class="btn btn-cancel">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Rules list -->
+      <div x-show="rulesLoading" class="loading">Loading rules...</div>
+      <div x-show="!rulesLoading && rules.length === 0 && !showRuleForm" class="empty">No auto-pin rules configured.</div>
+      <div class="rules-list">
+        <template x-for="rule in rules" :key="rule.id">
+          <div class="rule-card" :class="{ 'rule-disabled': !rule.enabled }">
+            <div class="rule-card-header">
+              <strong x-text="rule.name || '(unnamed)'"></strong>
+              <span class="badge" :class="rule.enabled ? 'badge-paper' : 'badge-inline_image'" x-text="rule.enabled ? 'enabled' : 'disabled'"></span>
+            </div>
+            <div class="rule-filters">
+              <template x-if="rule.disciplines && rule.disciplines.length > 0">
+                <span class="filter-tag">Disciplines: <span x-text="rule.disciplines.join(', ')"></span></span>
+              </template>
+              <template x-if="rule.authors && rule.authors.length > 0">
+                <span class="filter-tag">Authors: <span x-text="rule.authors.join(', ')"></span></span>
+              </template>
+              <template x-if="rule.cid_types && rule.cid_types.length > 0">
+                <span class="filter-tag">Types: <span x-text="rule.cid_types.join(', ')"></span></span>
+              </template>
+              <template x-if="rule.title_pattern">
+                <span class="filter-tag">Title: "<span x-text="rule.title_pattern"></span>"</span>
+              </template>
+              <template x-if="rule.created_after">
+                <span class="filter-tag">After: <span x-text="rule.created_after"></span></span>
+              </template>
+              <template x-if="rule.created_before">
+                <span class="filter-tag">Before: <span x-text="rule.created_before"></span></span>
+              </template>
+              <template x-if="(!rule.disciplines || rule.disciplines.length === 0) && (!rule.authors || rule.authors.length === 0) && (!rule.cid_types || rule.cid_types.length === 0) && !rule.title_pattern && !rule.created_after && !rule.created_before">
+                <span class="filter-tag">Matches all files</span>
+              </template>
+            </div>
+            <div class="rule-card-actions">
+              <button @click="toggleRuleEnabled(rule)" class="btn btn-sm" :class="rule.enabled ? 'btn-unpin' : 'btn-pin'" x-text="rule.enabled ? 'Disable' : 'Enable'"></button>
+              <button @click="editRule(rule)" class="btn btn-sm btn-edit">Edit</button>
+              <button @click="deleteRule(rule)" class="btn btn-sm btn-unpin">Delete</button>
+            </div>
+          </div>
+        </template>
+      </div>
+    </div><!-- end rules tab -->
   </div>
 </body>
 </html>

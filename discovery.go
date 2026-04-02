@@ -58,6 +58,9 @@ type SupplementaryFile struct {
 	Filename string `json:"filename"`
 }
 
+// OnRefreshFunc is called after each successful discovery refresh with the new items.
+type OnRefreshFunc func(items []DiscoveredItem)
+
 // Discovery manages periodic HAF queries and an in-memory CID cache.
 type Discovery struct {
 	db       *sql.DB
@@ -67,7 +70,8 @@ type Discovery struct {
 	mu    sync.RWMutex
 	items []DiscoveredItem
 
-	cancel context.CancelFunc
+	onRefresh OnRefreshFunc
+	cancel    context.CancelFunc
 }
 
 // NewDiscovery creates a Discovery instance and opens the database connection.
@@ -98,6 +102,11 @@ func NewDiscovery(databaseURL, appTag string, interval time.Duration) (*Discover
 		appTag:   appTag,
 		interval: interval,
 	}, nil
+}
+
+// SetOnRefresh registers a callback invoked after each successful discovery refresh.
+func (d *Discovery) SetOnRefresh(fn OnRefreshFunc) {
+	d.onRefresh = fn
 }
 
 // Start runs the initial query and begins periodic refresh.
@@ -235,5 +244,10 @@ func (d *Discovery) refresh(ctx context.Context) error {
 	d.mu.Unlock()
 
 	log.Printf("[discovery] found %d CIDs", len(items))
+
+	if d.onRefresh != nil {
+		d.onRefresh(items)
+	}
+
 	return nil
 }
