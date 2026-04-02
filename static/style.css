@@ -1,0 +1,265 @@
+:root {
+  --bg: #FAFAF8;
+  --bg-secondary: #F2F0EB;
+  --text: #2D2D2D;
+  --text-secondary: #6B7280;
+  --border: #E0DDD5;
+  --accent: #1B7A6D;
+  --accent-hover: #14605A;
+  --danger: #B31B4B;
+  --danger-hover: #8E1A3C;
+  --success: #8BA83E;
+  --radius: 6px;
+}
+
+:root.dark {
+  --bg: #1c1c1c;
+  --bg-secondary: #2a2a28;
+  --text: #e8e6e1;
+  --text-secondary: #9a9890;
+  --border: #3d3b36;
+  --accent: #30a897;
+  --accent-hover: #26897b;
+  --danger: #d4527a;
+  --danger-hover: #b31b4b;
+  --success: #a8c84e;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1.5rem;
+}
+
+header {
+  margin-bottom: 1.5rem;
+}
+
+.header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.header-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.header-logo {
+  width: 48px;
+  height: 48px;
+}
+
+.theme-toggle {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  padding: 0.35rem 0.5rem;
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--text-secondary);
+  transition: background 0.15s;
+}
+
+.theme-toggle:hover {
+  background: var(--border);
+}
+
+header h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+}
+
+.subtitle {
+  color: var(--text-secondary);
+  font-size: 0.9rem;
+}
+
+.status-bar {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+}
+
+.controls {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+  align-items: center;
+}
+
+.search-input, .filter-select {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-secondary);
+  color: var(--text);
+  font-size: 0.875rem;
+}
+
+.search-input {
+  flex: 1;
+  min-width: 200px;
+}
+
+.filter-select {
+  min-width: 150px;
+}
+
+.bulk-actions {
+  display: flex;
+  gap: 0.5rem;
+  margin-left: auto;
+}
+
+.btn {
+  padding: 0.5rem 1rem;
+  border: none;
+  border-radius: var(--radius);
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-pin {
+  background: var(--accent);
+  color: #fff;
+}
+
+.btn-pin:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-unpin {
+  background: var(--danger);
+  color: #fff;
+}
+
+.btn-unpin:hover:not(:disabled) {
+  background: var(--danger-hover);
+}
+
+.btn-sm {
+  padding: 0.3rem 0.6rem;
+  font-size: 0.8rem;
+}
+
+.btn-copy {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.9rem;
+  padding: 0 0.25rem;
+  opacity: 0.6;
+}
+
+.btn-copy:hover {
+  opacity: 1;
+}
+
+.papers-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.papers-table th {
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border-bottom: 2px solid var(--border);
+  font-weight: 600;
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.papers-table td {
+  padding: 0.6rem 0.75rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.papers-table tbody tr:hover {
+  background: var(--bg-secondary);
+}
+
+.cid-cell {
+  font-family: monospace;
+  white-space: nowrap;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+}
+
+.badge-paper {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.badge-supplementary {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.badge-inline_image {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.dark .badge-paper { background: #1e3a5f; color: #93c5fd; }
+.dark .badge-supplementary { background: #452a08; color: #fcd34d; }
+.dark .badge-inline_image { background: #064e3b; color: #6ee7b7; }
+
+.loading, .empty {
+  text-align: center;
+  padding: 3rem;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 768px) {
+  .controls {
+    flex-direction: column;
+  }
+  .bulk-actions {
+    margin-left: 0;
+    width: 100%;
+  }
+  .bulk-actions .btn {
+    flex: 1;
+  }
+  .papers-table {
+    font-size: 0.8rem;
+  }
+}

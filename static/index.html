@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PEvO Pinner</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    (function() {
+      var stored = localStorage.getItem('pevo-pinner-theme');
+      var dark = stored ? stored === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+      if (dark) document.documentElement.classList.add('dark');
+    })();
+    function toggleTheme() {
+      var isDark = document.documentElement.classList.toggle('dark');
+      localStorage.setItem('pevo-pinner-theme', isDark ? 'dark' : 'light');
+      document.getElementById('themeBtn').textContent = isDark ? '\u2600\uFE0F' : '\uD83C\uDF19';
+    }
+    document.addEventListener('DOMContentLoaded', function() {
+      document.getElementById('themeBtn').textContent =
+        document.documentElement.classList.contains('dark') ? '\u2600\uFE0F' : '\uD83C\uDF19';
+    });
+  </script>
+  <script defer src="app.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body>
+  <div x-data="pinnerApp" class="container">
+    <header>
+      <div class="header-row">
+        <div>
+          <h1>PEvO Pinner</h1>
+          <p class="subtitle">Help host scientific papers on IPFS</p>
+        </div>
+        <div class="header-right">
+          <button class="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode" id="themeBtn"></button>
+          <img src="logo.svg" alt="PEvO" class="header-logo">
+        </div>
+      </div>
+    </header>
+
+    <div class="status-bar">
+      <span x-text="`${status.pinned_count} of ${status.total_discovered} CIDs pinned`"></span>
+      <span x-show="status.next_refresh">| Next refresh in <span x-text="status.next_refresh"></span></span>
+    </div>
+
+    <div class="controls">
+      <input type="text" x-model="search" placeholder="Search title or author..." class="search-input">
+      <select x-model="disciplineFilter" class="filter-select">
+        <option value="">All disciplines</option>
+        <template x-for="d in disciplines" :key="d">
+          <option :value="d" x-text="d"></option>
+        </template>
+      </select>
+      <select x-model="typeFilter" class="filter-select">
+        <option value="">All types</option>
+        <option value="paper">Papers</option>
+        <option value="supplementary">Supplementary</option>
+        <option value="inline_image">Inline images</option>
+      </select>
+      <div class="bulk-actions">
+        <button @click="pinAll()" class="btn btn-pin" :disabled="loading">Pin All</button>
+        <button @click="unpinAll()" class="btn btn-unpin" :disabled="loading">Unpin All</button>
+      </div>
+    </div>
+
+    <div x-show="loading" class="loading">Loading...</div>
+
+    <table x-show="!loading && filteredPapers.length > 0" class="papers-table">
+      <thead>
+        <tr>
+          <th>Title</th>
+          <th>Author</th>
+          <th>Discipline</th>
+          <th>Type</th>
+          <th>CID</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <template x-for="paper in filteredPapers" :key="paper.cid">
+          <tr>
+            <td x-text="paper.title || '(untitled)'"></td>
+            <td x-text="paper.author"></td>
+            <td x-text="paper.discipline || '-'"></td>
+            <td><span class="badge" :class="'badge-' + paper.cid_type" x-text="paper.cid_type"></span></td>
+            <td class="cid-cell">
+              <code x-text="paper.cid.substring(0, 12) + '...'" :title="paper.cid"></code>
+              <button @click="copyToClipboard(paper.cid)" class="btn-copy" title="Copy CID">&#128203;</button>
+            </td>
+            <td>
+              <button
+                @click="togglePin(paper)"
+                class="btn btn-sm"
+                :class="paper.pinned ? 'btn-unpin' : 'btn-pin'"
+                :disabled="paper._busy"
+                x-text="paper._busy ? '...' : (paper.pinned ? 'Unpin' : 'Pin')">
+              </button>
+            </td>
+          </tr>
+        </template>
+      </tbody>
+    </table>
+
+    <div x-show="!loading && filteredPapers.length === 0" class="empty">
+      No papers found.
+    </div>
+  </div>
+</body>
+</html>
