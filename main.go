@@ -80,7 +80,7 @@ func main() {
 	// Start management server
 	srv := NewServer(discovery, backend, autopin, cfg.RefreshInterval)
 	httpServer := &http.Server{
-		Addr:              ":" + cfg.Port,
+		Addr:              "127.0.0.1:" + cfg.Port,
 		Handler:           srv,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
