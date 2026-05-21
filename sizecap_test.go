@@ -66,9 +66,14 @@ func TestEmbeddedNodePinRejectsOversizedGatewayResponse(t *testing.T) {
 func TestEmbeddedNodePinAcceptsUnderCapResponse(t *testing.T) {
 	const cap = int64(1024)
 
-	body := strings.Repeat("B", 100) // well under cap
+	// Use a content/CID pair so hash verification (added after this task)
+	// also passes — this test proves the size-cap accept path doesn't
+	// inadvertently clamp legitimate content.
+	body := []byte(strings.Repeat("B", 100)) // well under cap
+	matchingCID := cidForContent(t, body)
+
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(body))
+		_, _ = w.Write(body)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -81,15 +86,15 @@ func TestEmbeddedNodePinAcceptsUnderCapResponse(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = node.Close() })
 
-	if err := node.Pin(context.Background(), sizeCapTestCID); err != nil {
+	if err := node.Pin(context.Background(), matchingCID); err != nil {
 		t.Fatalf("Pin returned %v, want nil", err)
 	}
 
-	written, err := os.ReadFile(filepath.Join(tmp, "blocks", sizeCapTestCID))
+	written, err := os.ReadFile(filepath.Join(tmp, "blocks", matchingCID))
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	if string(written) != body {
+	if string(written) != string(body) {
 		t.Errorf("written body length = %d, want %d", len(written), len(body))
 	}
 }

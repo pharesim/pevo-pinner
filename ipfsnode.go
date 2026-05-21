@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,9 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	cid "github.com/ipfs/go-cid"
+	mh "github.com/multiformats/go-multihash"
 )
 
 // Public IPFS gateways used to fetch content when pinning.
@@ -89,15 +93,28 @@ func (n *EmbeddedNode) blockPath(cid string) string {
 	return filepath.Join(n.dataDir, "blocks", cid)
 }
 
-func (n *EmbeddedNode) Pin(ctx context.Context, cid string) error {
-	if err := ValidateCID(cid); err != nil {
+func (n *EmbeddedNode) Pin(ctx context.Context, cidStr string) error {
+	if err := ValidateCID(cidStr); err != nil {
 		return err
 	}
+	// Parse the CID once so each gateway attempt can hash-verify against the
+	// requested multihash. A malformed multihash here is a programmer error
+	// (ValidateCID's regex passed), so we surface it loudly instead of
+	// silently writing unverified bytes.
+	c, err := cid.Decode(cidStr)
+	if err != nil {
+		return fmt.Errorf("decoding CID %s: %w", cidStr, err)
+	}
+	expected, err := mh.Decode(c.Hash())
+	if err != nil {
+		return fmt.Errorf("decoding multihash for %s: %w", cidStr, err)
+	}
+
 	// Check if already pinned and content exists
-	path := n.blockPath(cid)
+	path := n.blockPath(cidStr)
 	if _, err := os.Stat(path); err == nil {
 		n.mu.Lock()
-		n.pins[cid] = true
+		n.pins[cidStr] = true
 		n.mu.Unlock()
 		n.savePins()
 		return nil
@@ -106,7 +123,7 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cid string) error {
 	// Fetch from public gateways
 	var lastErr error
 	for _, gw := range publicGateways {
-		url := fmt.Sprintf("%s/ipfs/%s", gw, cid)
+		url := fmt.Sprintf("%s/ipfs/%s", gw, cidStr)
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
 			lastErr = err
@@ -125,6 +142,14 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cid string) error {
 			continue
 		}
 
+		// Fresh hasher per gateway attempt: a previous gateway's partial
+		// bytes must not bleed into this iteration's digest.
+		hasher, err := mh.GetHasher(expected.Code)
+		if err != nil {
+			resp.Body.Close()
+			return fmt.Errorf("unsupported multihash code %d for %s: %w", expected.Code, cidStr, err)
+		}
+
 		// Write to local storage
 		f, err := os.Create(path)
 		if err != nil {
@@ -132,10 +157,13 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cid string) error {
 			return fmt.Errorf("creating block file: %w", err)
 		}
 
-		// Cap the read at maxPinBytes. Read one extra byte: if N reaches 0
-		// after the copy, the gateway tried to give us more than the cap.
+		// Layering: LimitedReader bounds the byte count first (so a hostile
+		// gateway streaming gigabytes does not exhaust memory through the
+		// hasher); TeeReader fans the bounded stream into the hasher; Copy
+		// writes the file from the tee.
 		lr := &io.LimitedReader{R: resp.Body, N: n.maxPinBytes + 1}
-		_, err = io.Copy(f, lr)
+		tee := io.TeeReader(lr, hasher)
+		_, err = io.Copy(f, tee)
 		resp.Body.Close()
 		f.Close()
 		if err != nil {
@@ -149,15 +177,23 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cid string) error {
 			continue
 		}
 
+		actual := hasher.Sum(nil)
+		if !bytes.Equal(actual, expected.Digest) {
+			os.Remove(path)
+			lastErr = fmt.Errorf("gateway %s content hash mismatch for %s: expected %x, got %x", gw, cidStr, expected.Digest, actual)
+			log.Printf("[ipfs] %v", lastErr)
+			continue
+		}
+
 		n.mu.Lock()
-		n.pins[cid] = true
+		n.pins[cidStr] = true
 		n.mu.Unlock()
 		n.savePins()
-		log.Printf("[ipfs] pinned %s (fetched from %s)", cid, gw)
+		log.Printf("[ipfs] pinned %s (fetched from %s)", cidStr, gw)
 		return nil
 	}
 
-	return fmt.Errorf("failed to fetch CID %s from any gateway: %w", cid, lastErr)
+	return fmt.Errorf("failed to fetch CID %s from any gateway: %w", cidStr, lastErr)
 }
 
 func (n *EmbeddedNode) Unpin(_ context.Context, cid string) error {
