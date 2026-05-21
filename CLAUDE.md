@@ -37,8 +37,7 @@ Everything under `agents/` is documentation and coordination. Source code lives 
 
 ## Trust model
 
-- **`EmbeddedNode`** (current HTTP-cache mode): fetches reassembled UnixFS file bytes from public gateways and stores them in a flat block file per CID. No trustless verification; gateway is trusted. Size-capped (`MAX_PIN_BYTES`) and CID-validated, but the bytes themselves are not hash-verified end-to-end. Use only against gateways you trust.
-- **`EmbeddedNode`** (post-boxo rewrite, in flight): real in-process IPFS node via `github.com/ipfs/boxo`. Bitswap + DHT + trustless block-level hash verification by construction. See `tasks/pending/pinner-embedded-ipfs-node-via-boxo.md`.
+- **`EmbeddedNode`**: real in-process IPFS node via `github.com/ipfs/boxo`. libp2p + DHT + bitswap walk the DAG one block at a time; each block's CID is verified against the digest of its bytes on receipt. On bitswap timeout, a trustless CAR-fetch fallback chain runs (`PEVO_MAIN_GATEWAY_URL` → operator-supplied `FALLBACK_GATEWAYS` → mesh-discovered pinners → public defaults); `go-car/v2`'s `BlockReader` hash-verifies every block during import. Trustless-by-construction: no gateway or peer in the chain is trusted with content authority.
 - **`PinataBackend`**: pins by CID via Pinata's API. The pinner never sees the bytes; trust is delegated to Pinata.
 
 Operators picking `IPFS_MODE=pinata` accept the weaker guarantee. Document this in operator-facing copy.

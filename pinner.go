@@ -18,7 +18,22 @@ func ValidateCID(cid string) error {
 }
 
 // IPFSBackend defines the interface for IPFS pin management.
-// Implementations: EmbeddedNode (local blockstore + gateway) and PinataBackend (Pinata API).
+//
+// Trust model — divergent by implementation:
+//
+//   - EmbeddedNode runs an in-process libp2p + bitswap node and a boxo-backed
+//     HTTP gateway. Every block landed in the local blockstore was hash-
+//     verified against its CID by either bitswap (on receipt from a peer) or
+//     go-car/v2's BlockReader (during CAR-fallback import). The trust model
+//     is trustless-by-construction: gateways and peers in the fetch chain
+//     are not trusted with content authority.
+//   - PinataBackend pins by CID via Pinata's HTTPS API. The pinner never sees
+//     the bytes; Pinata is trusted to honor the requested CID. Operators
+//     picking IPFS_MODE=pinata accept this weaker guarantee.
+//
+// Both implementations validate the CID shape at every entry point. The
+// guarantee asymmetry above concerns the *bytes behind* the CID, not the
+// CID itself.
 type IPFSBackend interface {
 	// Pin fetches and stores content for the given CID.
 	Pin(ctx context.Context, cid string) error
