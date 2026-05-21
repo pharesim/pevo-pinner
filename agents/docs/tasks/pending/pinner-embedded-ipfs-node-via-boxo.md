@@ -86,3 +86,293 @@ Pinner brainstorm refined the five sub-decisions the Implementation notes flagge
 - Original audit chunk that motivated the hash-verify task: `.context/audit-2026-04-21/chunk-6-correctness-reviewer.md`.
 - Boxo: `github.com/ipfs/boxo` (Kubo libraries decomposed for embedding).
 - Boxo gateway client (trustless CAR fetch): see boxo's `boxo/gateway/client` or its successor.
+
+## Implementation plan (2026-05-21)
+
+The brainstorm above settled the WHAT. This section captures the HOW: file shape, sequencing, dependencies, test layout. Eight implementation units (U1–U8) cover the rewrite end-to-end. Plan depth: Deep.
+
+### Plan summary
+
+Replace the current HTTP-cache `EmbeddedNode` with a boxo-backed in-process IPFS node. Single-shot replacement: no parallel `IPFS_MODE=boxo` coexistence with the HTTP-cache mode. The pinner stays a single static Go binary; everything from libp2p host to gateway handler is in-process. Eight ordered units gate on dependency: deps (U1) → libp2p host + DHT (U2) → blockstore + pinset (U3) → Pin via bitswap + CAR fallback (U4) → pubsub mesh (U5) → boxo gateway handler (U6) → lifecycle integration (U7) → test rewrite (U8).
+
+### Output structure
+
+New files land flat at the repo root, alongside existing `ipfsnode.go` (which is rewritten in place to top-level lifecycle):
+
+```
+ipfsnode.go              # top-level EmbeddedNode (lifecycle + IPFSBackend impl)
+ipfsnode_libp2p.go       # host + DHT + NAT construction (U2)
+ipfsnode_repo.go         # flatfs blockstore + boxo pinset (U3)
+ipfsnode_fetch.go        # bitswap + CAR-fetch fallback chain (U4, U5 integration)
+ipfsnode_pubsub.go       # community pinner mesh advertise + discover (U5)
+ipfsnode_gateway.go      # boxo gateway HTTP handler (U6)
+ipfsnode_integration_test.go  # //go:build integration end-to-end coverage (U8)
+```
+
+This shape is directional, not prescriptive — the implementer may collapse files if a smaller surface emerges. The per-unit `Files:` lists below remain authoritative for what each unit creates or modifies.
+
+### High-level technical design
+
+Pin's fetch chain on cache-miss (directional guidance for review, not implementation specification):
+
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Pin as EmbeddedNode.Pin
+    participant Bitswap
+    participant CAR as CAR-fetch fallback
+    participant PEvO as PEvO main
+    participant Mesh as Mesh-discovered peers
+    participant Pub as Public gateways
+
+    Caller->>Pin: Pin(ctx, cid)
+    Pin->>Pin: ValidateCID + drain gate
+    Pin->>Bitswap: GetBlocks(cid) via session
+    alt verified within BITSWAP_TIMEOUT
+        Bitswap-->>Pin: blocks
+    else timeout
+        Pin->>CAR: try chain in order
+        CAR->>PEvO: GET /ipfs/<cid> (Accept: car)
+        alt PEvO main serves
+            PEvO-->>CAR: CAR stream
+        else fail
+            CAR->>Mesh: try mesh peers' gateways
+            alt mesh hit
+                Mesh-->>CAR: CAR stream
+            else fail
+                CAR->>Pub: try public gateways
+                Pub-->>CAR: CAR stream
+            end
+        end
+        CAR-->>Pin: blocks (boxo block-hash-verifies on import)
+    end
+    Pin->>Pin: AddPin (boxo pinset)
+    Pin-->>Caller: nil
+```
+
+Trustless verification holds across every branch: bitswap and CAR-import both block-level hash-verify by construction. No centralized-gateway trust is added even when the fallback chain runs.
+
+### Key technical decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Plan location | Append to this task file, not `docs/plans/` | Project convention per CLAUDE.md memory; brainstorm + plan live with the task they describe. |
+| File split | Split `ipfsnode*.go` into 4–5 cohesive files | The current single file is already 456 lines; the rewrite easily doubles that. Splitting on responsibility (lifecycle / repo / fetch / pubsub / gateway) preserves grep-ability. |
+| Boxo repo path | `<dataDir>/ipfs-repo/` (boxo flatfs convention) | Keeps boxo's expected layout intact; operator-inspectable with `ls`. |
+| libp2p listen address | Random port (let libp2p pick) by default | Safest default for the common case (no public IP); operators with public IPs override via `LIBP2P_LISTEN`. |
+| Pubsub topic format | `/pevo-pinners/<APP_TAG>/heartbeat/1.0.0` | libp2p protocol-versioning convention; `<APP_TAG>` separates `pevo` and `pevotest` meshes per brainstorm decision. |
+| Default per-CID bitswap timeout | 60s | Brainstorm-stated default. Tunable via `BITSWAP_TIMEOUT`. |
+| Default heartbeat cadence / cache TTL | 30s / 5min | Cache TTL > 10× cadence so one dropped heartbeat does not evict a healthy peer; cadence small enough that newly-online pinners are discovered within a minute. |
+| Default tier-3 fallback gateways | `ipfs.io`, `dweb.link`, `cloudflare-ipfs.com`, `gateway.pinata.cloud` | Carry forward the existing `publicGateways` list as the final fallback after PEvO main and mesh peers. |
+| Test gating mechanism | `//go:build integration` build tag | Go-idiomatic; default `go test ./...` stays offline; `go test -tags integration ./...` opts into network coverage. |
+| pins.json migration | None (clean slate) | Brainstorm decision: pre-launch, no installed base. File left in place on disk for operator inspection if present. |
+
+### Implementation units
+
+#### U1. Add boxo + libp2p dependency surface
+
+**Goal:** Pull in `github.com/ipfs/boxo` and the libp2p modules required by U2–U6 without removing anything else yet.
+
+**Requirements:** Foundation for deliverables 1–5.
+
+**Dependencies:** none.
+
+**Files:** `go.mod`, `go.sum`.
+
+**Approach:** `go get` boxo + libp2p at pinned versions (no `latest`). Verify the resulting binary remains static (no cgo introduced via transitive deps). Run `go mod tidy` to drop anything orphaned.
+
+**Patterns to follow:** existing minimal-dependency posture in `go.mod` (`go-cid`, `go-multihash`, `lib/pq` only).
+
+**Test scenarios:** none — pure dependency add. `go build` + `go vet` are the gates.
+
+**Verification:** `go build ./...` produces a single static binary; `go mod tidy` is a no-op; `go list -deps -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./...` is empty.
+
+#### U2. libp2p host + DHT + NAT lifecycle
+
+**Goal:** Construct a libp2p host with DHT in client mode, AutoNAT/UPnP/NAT-PMP, and PEvO main as a default bootstrap peer. Wire host lifecycle into the `EmbeddedNode` struct.
+
+**Requirements:** Brainstorm decisions on libp2p/NAT and PEvO main as anchor.
+
+**Dependencies:** U1.
+
+**Files:** `ipfsnode.go` (rewrite scaffold, replaces the current HTTP-cache struct fields), new `ipfsnode_libp2p.go`, `config.go` (new env vars `LIBP2P_LISTEN`, `PEVO_MAIN_LIBP2P_ADDR`).
+
+**Approach:** libp2p host with TCP + QUIC transports, DHT client mode, AutoNAT + UPnP + NAT-PMP + circuit-relay client. Dial PEvO main multiaddr on startup as a non-blocking task; reconnect on disconnect via libp2p's connection manager. Boot failure on the bootstrap peer logs a warning but does NOT block startup — mesh discovery (U5) can substitute.
+
+**Test scenarios:**
+- Unit: host construction with default config produces a host with at least one TCP and one QUIC listener.
+- Unit: bootstrap peer dial failure logs `[ipfs] bootstrap dial failed: <err>` and startup proceeds.
+- Integration (`//go:build integration`): host dials PEvO main multiaddr and completes a bitswap handshake.
+
+**Verification:** startup log shows `[ipfs] libp2p host started: <peer-id>` and listen multiaddrs; reachability state logged when AutoNAT resolves.
+
+#### U3. Boxo blockstore + pinset on flatfs
+
+**Goal:** Replace the current `<dataDir>/blocks/<cid>` flat-file scheme with boxo's flatfs-backed blockstore and pinset. Wire pinset into `IsPinned`, `PinnedCIDs`, and `Unpin`.
+
+**Requirements:** Acceptance — deliverables 3 (IsPinned via boxo pin set) and 4 (Unpin + GC).
+
+**Dependencies:** U1.
+
+**Files:** `ipfsnode.go`, new `ipfsnode_repo.go`.
+
+**Approach:** flatfs datastore at `<dataDir>/ipfs-repo/blocks/` (sharded directory layout — boxo default). Boxo pinset persisted alongside. `IsPinned` queries the pinset; `Unpin` removes from pinset and triggers blockstore GC. `PinnedCIDs` enumerates the pinset's union of recursive + direct pins. `ValidateCID` guard remains at every entry point per Acceptance deliverable 6.
+
+**Test scenarios:**
+- Unit: AddPin → IsPinned returns true; PinnedCIDs contains the CID.
+- Unit: RemovePin → IsPinned returns false; subsequent GC pass reclaims the unreferenced blocks.
+- Unit: PinnedCIDs across recursive + direct pin types deduplicates correctly.
+- Unit: ValidateCID rejects malformed input before any boxo call.
+- Unit: pinset state survives an in-process restart of the EmbeddedNode (open → close → open).
+
+**Verification:** `<dataDir>/ipfs-repo/blocks/` populates with sharded block files (multiple directories under `.../blocks/`); pinset state survives `EmbeddedNode.Close` + reconstruct.
+
+#### U4. EmbeddedNode.Pin via bitswap with CAR-fetch fallback chain
+
+**Goal:** Replace the HTTP-cache Pin with a bitswap-primary fetch and a trustless CAR-fetch fallback chain on timeout.
+
+**Requirements:** Acceptance — deliverable 2 (bitswap + trustless CAR fallback).
+
+**Dependencies:** U1, U2, U3.
+
+**Files:** `ipfsnode.go`, new `ipfsnode_fetch.go`.
+
+**Execution note:** characterization-first — capture the current `EmbeddedNode.Pin` semantic contract (Drain gate check, `ErrPinnerShuttingDown` rejection, ValidateCID-first ordering) in tests before swapping the body, so the rewrite preserves IPFSBackend invariants. The fetch mechanism changes; the surrounding contract does not.
+
+**Approach:** Pin walks the DAG via boxo's UnixFS + bitswap session. Per-CID timeout default 60s (`BITSWAP_TIMEOUT` env override). On timeout, the CAR-fetch fallback chain runs in order: PEvO main → community pinners (U5) → tier-3 public gateways. Each tier sends `Accept: application/vnd.ipld.car`; boxo's CAR import block-level-verifies every block. All chains exhausted → return error to caller. Existing drain-gate coordination (`drainMu`, `done`, `inFlight`, per-Pin cancels) is preserved in shape: replace the HTTP-loop body, keep the gating; cancels apply to the bitswap session + CAR-fetch HTTP requests.
+
+**Patterns to follow:** the existing drain-gate scaffolding in current `EmbeddedNode.Pin` — the rewrite reuses the shape, only the fetch mechanism changes.
+
+**Test scenarios:**
+- Unit: malformed CID rejected by `ValidateCID` before any network activity.
+- Unit: Pin called after Drain returns `ErrPinnerShuttingDown`.
+- Unit: Pin's in-flight cancel propagates into the bitswap session and the CAR-fetch HTTP request on force-cancel.
+- Integration (`//go:build integration`): real `ipfs add`-shape CID is fetched via bitswap from PEvO main and verified locally.
+- Integration: multi-block file (>256 KiB) is fetched and assembled correctly; block count in `<dataDir>/ipfs-repo/blocks/` matches expectations.
+- Integration: bitswap timeout (configurable to ~100 ms for the test) → CAR fallback activates and lands the content.
+- Integration: hostile CAR-fetch server returning bytes whose hash does not match the requested CID is rejected at boxo's CAR-import boundary; no partial block lands.
+
+**Verification:** an `ipfs add`-shape CID known to be served by PEvO main is pinned end-to-end; `<dataDir>/ipfs-repo/blocks/` shows the expected sharded block files.
+
+#### U5. Community pinner pubsub mesh advertise + discovery
+
+**Goal:** Pinners advertise on a libp2p pubsub topic per `APP_TAG`; received heartbeats populate a known-peers cache that feeds bitswap providers and the CAR-fetch fallback chain.
+
+**Requirements:** Brainstorm decision on community pinner mesh auto-discovery.
+
+**Dependencies:** U2.
+
+**Files:** new `ipfsnode_pubsub.go`, `config.go` (new env vars `MESH_HEARTBEAT_INTERVAL`, `MESH_CACHE_TTL`, `MESH_ADVERTISE_DISABLED`).
+
+**Approach:** Topic = `/pevo-pinners/<APP_TAG>/heartbeat/1.0.0`. Heartbeat payload: pinner peer ID, libp2p multiaddrs, optional public gateway URL. Cadence default 30s; cache TTL default 5min. On receive: dial sender as a bitswap peer; insert gateway URL (if any) into the CAR-fetch fallback chain ahead of public gateways, behind PEvO main. `MESH_ADVERTISE_DISABLED=1` switches the pinner to subscribe-only (still consumes the mesh but does not publish heartbeats).
+
+**Test scenarios:**
+- Unit: heartbeat payload round-trips through serialize → deserialize.
+- Unit: stale heartbeats (older than `MESH_CACHE_TTL`) are evicted from the known-peers cache.
+- Unit: `MESH_ADVERTISE_DISABLED=1` suppresses publish but not subscribe.
+- Unit: fallback chain insertion order is deterministic (PEvO main first, mesh entries by heartbeat receipt time, public gateways last).
+- Integration (`//go:build integration`): two pinners on the same `APP_TAG` topic discover each other within one heartbeat interval; an `APP_TAG` mismatch isolates them (cross-talk-free).
+
+**Verification:** startup log line `[ipfs] mesh subscribed to <topic>`; on heartbeat receipt `[ipfs] mesh discovered pinner <peer-id> (gateway=<url-or-none>)`.
+
+#### U6. Boxo HTTP gateway handler (pinned-only)
+
+**Goal:** Replace `handleGateway` with boxo's gateway handler, serving only locally-pinned content. Multi-block UnixFS files served end-to-end.
+
+**Requirements:** Acceptance — deliverable 5 (boxo gateway serves any UnixFS DAG).
+
+**Dependencies:** U3.
+
+**Files:** `ipfsnode.go`, new `ipfsnode_gateway.go`. Also updates `server.go` handler `handleIPFSProxy` so the type-assert dispatch still works (or simplifies once the embedded path is uniform).
+
+**Approach:** boxo's `gateway.Handler` wired to a blockstore-only backend — explicitly NO pull-through bitswap fetch for unpinned CIDs requested via HTTP (resource-control default per brainstorm). Path-style only (`/ipfs/<cid>`); subdomain gateway out of scope. `ValidateCID` guard remains at route entry.
+
+**Test scenarios:**
+- Unit: `GET /ipfs/<pinned-cid>` returns 200 with the correct bytes.
+- Unit: `GET /ipfs/<unpinned-cid>` returns 404 (no pull-through fetch).
+- Unit: malformed CID in path returns 400 (ValidateCID rejects before reaching boxo).
+- Unit: multi-block UnixFS file (>256 KiB) is served correctly end-to-end — the prior single-file handler could not do this.
+- Unit: `Range` header honored for partial reads (boxo gateway handler supports this out of the box; verify it survives the integration).
+
+**Verification:** `curl http://localhost:8080/ipfs/<pinned-multi-block-cid>` returns the full file; `Content-Length` matches.
+
+#### U7. Lifecycle integration — Drain/Close, config knobs, startup logging
+
+**Goal:** Integrate the boxo node into the existing Drain/Close shutdown sequence and surface every new operator-tunable knob.
+
+**Requirements:** Acceptance — deliverable 7 (migration path documented as clean-slate); preservation of single-binary deploy.
+
+**Dependencies:** U2, U3, U4, U5, U6.
+
+**Files:** `ipfsnode.go`, `config.go`, `main.go`, `.env.example`.
+
+**Approach:** New env vars (bare-prefix convention): `LIBP2P_LISTEN`, `PEVO_MAIN_LIBP2P_ADDR`, `PEVO_MAIN_GATEWAY_URL`, `FALLBACK_GATEWAYS` (comma-separated), `BITSWAP_TIMEOUT`, `MESH_HEARTBEAT_INTERVAL`, `MESH_CACHE_TTL`, `MESH_ADVERTISE_DISABLED`. Defaults documented in `.env.example`. `Drain` order: stop accepting new Pin calls (existing gate) → cancel in-flight bitswap sessions + CAR-fetch requests → wait `inFlight.Wait()` → tear down pubsub subscriptions. `Close` shuts down the libp2p host + gateway server + datastore. Existing `ErrPinnerShuttingDown` contract preserved. Startup log gains one line per new knob alongside the existing `AUTOPIN_*` lines.
+
+**Test scenarios:**
+- Unit: missing `PEVO_MAIN_LIBP2P_ADDR` logs a warning and startup continues.
+- Unit: invalid `FALLBACK_GATEWAYS` entry surfaces a clear error at startup, not a runtime panic.
+- Unit: `Drain(ctx)` with a hung in-flight bitswap session and a deadline returns `ctx.Err()` after force-cancel — same contract as the current `EmbeddedNode.Drain`.
+- Integration (`//go:build integration`): graceful shutdown drains an in-flight bitswap session within the configured grace window.
+
+**Verification:** startup log shows every new env-var value and chosen default; existing `/api/status` extension (from the autopin task) optionally surfaces relevant ones if useful.
+
+#### U8. Test fixture rewrite — real UnixFS CIDs, build-tag gate
+
+**Goal:** Delete the synthetic `cidForContent` fixture and rewrite tests to use real UnixFS-derived CIDs via boxo's UnixFS primitives. Gate DHT / bitswap / network-dependent tests behind `//go:build integration` so default `go test ./...` stays offline-only.
+
+**Requirements:** Acceptance — deliverable 3 sub-clause ("the prior single-block-only test fixture is deleted or rewritten"); brainstorm decision on test fixtures.
+
+**Dependencies:** U1, U3, U4, U6.
+
+**Files:** `contenthash_test.go` (delete — the hash-verify code it tested is removed in U4), `shutdown_test.go` (rewrite to use boxo's drain primitives + UnixFS-derived CIDs), `sizecap_test.go` (delete or rewrite — boxo enforces block-level limits internally; the per-CID size cap may need a different shape or move into the CAR-fetch fallback path), new `ipfsnode_integration_test.go` for end-to-end coverage.
+
+**Approach:** Build CIDs by chunking content through boxo's UnixFS importer, so the resulting CID is what `ipfs add` would produce. For unit-level pin / IsPinned / Unpin tests, this means real CIDs over an in-memory blockstore — no network required. For end-to-end coverage (bitswap from PEvO main, CAR-fetch fallback chain, pubsub mesh between two pinners), gate behind `//go:build integration`. Drop the multi-gateway-loop tests outright; they no longer apply.
+
+**Patterns to follow:** existing `t.TempDir()` + `t.Cleanup(...)` + `httptest.NewServer` patterns are reusable for CAR-fetch fallback fakes.
+
+**Test scenarios:** the rewrite of each existing test file; this unit's test scenarios are the test scenarios from U2–U7 collectively, plus the deletions.
+
+**Verification:** `go test ./...` (no tags) runs offline-only, completes under 5s, all tests pass; `go test -tags integration ./...` runs the network-dependent suite when CI grants egress and passes against PEvO main.
+
+### Scope boundaries
+
+**Active in this plan:** U1–U8 above.
+
+**Deferred to follow-up work** (planned, but separate tasks):
+- Subdomain gateway support (`<cid>.ipfs.example.com`).
+- DHT server-mode opt-in env knob — the brainstorm noted server mode as an operator opt-in; the knob can land as a follow-on task once the client-mode default is proven.
+- `/api/status` extension to expose libp2p peer ID, reachability state, and mesh-peer count.
+
+**Outside this product's identity** (brainstorm "Out of scope" — restated for the plan reader):
+- Two-step rollout (revert hash-verify first, boxo later).
+- `IPFS_MODE=boxo` coexisting with HTTP-cache mode as a third backend.
+- Badger blockstore (flatfs is the choice).
+- DHT server-mode default (client mode is the choice).
+- Pull-through public gateway (pinned-only is the choice).
+- Configurable chunker / block-size / CID-version.
+- Any change to Pinata mode.
+- Running a separate Kubo container or external IPFS service alongside the pinner binary.
+
+### Risks + mitigations
+
+- **Dependency surface bloat.** Boxo + libp2p pulls a wide transitive graph; cgo may sneak in via a transitive. Mitigate at U1 by gating on `go list -deps -f '{{if .CgoFiles}}{{.ImportPath}}{{end}}' ./...` empty. If a transitive does introduce cgo, evaluate alternatives or accept and document.
+- **NAT / connectivity in CI.** libp2p NAT traversal silently fails in CI environments without network egress. Mitigate via `//go:build integration` gate on every network-touching test (U8).
+- **Pubsub mesh has low signal at launch.** With only PEvO main and a handful of pinners, the mesh is mostly empty. Mitigate by treating mesh as additive — bitswap via PEvO main as bootstrap delivers content from day one; mesh discovery is value-add.
+- **Boxo API drift.** Boxo is pre-1.0 at the time of writing; minor versions may break APIs. Mitigate by pinning the exact version in `go.mod` and gating upgrades behind a dedicated task.
+- **Embedded-mode broken for `ipfs add` content until U4 lands.** Per brainstorm sequencing: single-shot replacement leaves embedded mode non-functional against real `ipfs add` CIDs in the interim. Mitigate by communicating operator guidance to use `IPFS_MODE=pinata` for the bridge period; document in README on the implementing branch before merge.
+
+### Test strategy
+
+- **Default offline-only:** `go test ./...` runs unit tests against in-memory blockstores + UnixFS-derived CIDs. Fast, deterministic, no network.
+- **Network-dependent suite:** `go test -tags integration ./...` runs end-to-end tests against PEvO main and a paired in-process pinner for mesh coverage. Gated by `//go:build integration` build tag.
+- **Build-tag is the single gate:** no `if testing.Short()` or env-var skips; one mechanism.
+- **Race-detector clean:** `go test -race ./...` passes on the offline suite. The integration suite may have race-detector noise from libp2p internals; if so, document and isolate.
+
+### Implementation-time unknowns
+
+Resolved during execution, not here:
+
+- Exact boxo subpackage import paths (the library is decomposed into many modules; the implementer picks the right ones once they sit with the code).
+- The precise shape of `EmbeddedNode`'s field set after the rewrite (the brainstorm-stable parts — drain coordination, ValidateCID guards, lifecycle methods — remain; the fetch internals are replaced wholesale).
+- Whether the boxo gateway handler exposes a hook for the `ValidateCID` pre-check at the right layer, or whether the existing route-level guard is the cleaner place.
+- The pubsub heartbeat payload encoding (protobuf vs JSON vs raw CBOR) — the implementer picks once the boxo / libp2p version is pinned.
