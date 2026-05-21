@@ -31,11 +31,24 @@ docker run --rm \
   -e APP_TAG=pevo \
   -p 8421:8421 -p 8080:8080 \
   -v pevo-pinner-data:/data \
-  --stop-timeout 60 \
+  --stop-timeout 30 \
   pevo-pinner
 ```
 
-The `--stop-timeout 60` gives the drain mechanism time to complete in-flight pin operations before SIGKILL. The default Docker grace (10s) is too short; see `agents/docs/tasks/pending/pinner-shutdown-drain-in-flight-pins.md` for the rationale.
+### Shutdown grace period
+
+On SIGTERM the pinner stops accepting new pins, drains in-flight pin operations under a hard timeout, then closes the IPFS backend. Worst case is roughly **20 seconds** (10s HTTP server shutdown + 5s pin drain + ~5s backend close). Orchestrators that kill the process before this window completes will leave partial block files on disk that may be promoted to fully-pinned status on the next start.
+
+Set the grace period to at least 30 seconds for headroom:
+
+| Orchestrator | Setting | Recommended value |
+|---|---|---|
+| `docker run` | `--stop-timeout` | `30` |
+| `docker-compose.yml` | `stop_grace_period` | `30s` |
+| systemd unit | `TimeoutStopSec` | `30s` |
+| Kubernetes Pod spec | `terminationGracePeriodSeconds` | `30` |
+
+If you raise the drain budget in code, raise these to match (drain budget + ~15s headroom for HTTP shutdown and backend close).
 
 ## Configuration
 

@@ -99,15 +99,22 @@ func main() {
 		log.Printf("HTTP server shutdown error: %v", err)
 	}
 
-	// Stop discovery before draining the backend so no fresh autopin callback
-	// queues more pins behind the drain barrier. discovery.Stop cancels the
-	// refresh ticker and closes the DB pool.
+	// Halt new discovery cycles. This cancels the refresh ticker and closes
+	// the DB pool; it does NOT preempt an in-flight refresh whose autopin
+	// callback may still call backend.Pin with the long-lived outer ctx. The
+	// drain gate inside EmbeddedNode.Pin is the actual barrier that keeps
+	// late Pin calls out — see EmbeddedNode.Drain / ErrPinnerShuttingDown.
 	discovery.Stop()
 
 	// Drain in-flight pins under a hard timeout. Bounded so a frozen gateway
 	// can't wedge the process indefinitely; in-flight goroutines past the
-	// deadline are abandoned (the process is about to exit anyway).
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// deadline are abandoned (the process is about to exit anyway). The 5s
+	// budget keeps the worst-case shutdown wall-clock (~20s: 10s HTTP +
+	// 5s drain + 5s backend close) inside common orchestrator SIGTERM grace
+	// windows (Docker's 10s default is still too short — see README on
+	// stop_grace_period). Operators who want a longer drain should raise
+	// their orchestrator's grace period to match.
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer drainCancel()
 	if err := backend.Drain(drainCtx); err != nil {
 		log.Printf("backend drain incomplete: %v", err)
