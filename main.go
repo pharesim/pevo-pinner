@@ -52,33 +52,27 @@ func main() {
 		log.Printf("using Pinata backend")
 	}
 
-	// Wire auto-pin: after each discovery refresh, pin CIDs matching rules
+	// Wire auto-pin: after each discovery refresh, pin matching CIDs through a
+	// bounded pool with per-author shedding. Pool drains before the callback
+	// returns so successive discovery batches don't overlap each other's
+	// in-flight pins.
+	runner := NewAutoPinRunner(backend, cfg.AutoPinConcurrency, cfg.AutoPinAuthorCap)
 	discovery.SetOnRefresh(func(items []DiscoveredItem) {
-		cids := autopin.MatchingCIDs(items)
-		if len(cids) == 0 {
+		matched := autopin.MatchingItems(items)
+		if len(matched) == 0 {
 			return
 		}
-		pinned := 0
-		for _, cid := range cids {
-			already, _ := backend.IsPinned(ctx, cid)
-			if already {
-				continue
-			}
-			if err := backend.Pin(ctx, cid); err != nil {
-				log.Printf("[autopin] failed to pin %s: %v", cid, err)
-			} else {
-				pinned++
-			}
-		}
-		if pinned > 0 {
-			log.Printf("[autopin] pinned %d new CIDs (%d matched rules)", pinned, len(cids))
+		res := runner.Run(ctx, matched)
+		if res.Pinned > 0 || res.Failed > 0 {
+			log.Printf("[autopin] pinned %d new CIDs (%d matched rules, %d failed, %d shed)",
+				res.Pinned, res.Matched, res.Failed, res.Shed)
 		}
 	})
 
 	discovery.Start(ctx)
 
 	// Start management server
-	srv := NewServer(discovery, backend, autopin, cfg.RefreshInterval)
+	srv := NewServer(discovery, backend, autopin, runner, cfg.RefreshInterval)
 	httpServer := &http.Server{
 		Addr:              "127.0.0.1:" + cfg.Port,
 		Handler:           srv,

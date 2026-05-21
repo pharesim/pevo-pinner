@@ -319,7 +319,9 @@ document.addEventListener('alpine:init', () => {
       try {
         const resp = await fetch('/api/autopin/evaluate', { method: 'POST' });
         const data = await resp.json();
-        this.evaluateResult = `Matched ${data.matched} CIDs, pinned ${data.pinned} new` + (data.failed > 0 ? `, ${data.failed} failed` : '');
+        this.evaluateResult = `Matched ${data.matched} CIDs, pinned ${data.pinned} new`
+          + (data.failed > 0 ? `, ${data.failed} failed` : '')
+          + (data.shed > 0 ? `, ${data.shed} shed (per-author cap)` : '');
         await this.fetchPapers();
         await this.fetchStatus();
       } catch (e) {

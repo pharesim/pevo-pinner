@@ -15,17 +15,26 @@ import (
 // realistic paper PDF or supplementary archive, well below disk-fill territory.
 const defaultMaxPinBytes int64 = 256 << 20
 
+// Autopin defaults: bounded worker pool + per-author cap defend the autopin
+// queue against a single hostile accredited author broadcasting many CIDs.
+const (
+	defaultAutoPinConcurrency = 4
+	defaultAutoPinAuthorCap   = 20
+)
+
 type Config struct {
-	HAFDatabaseURL  string
-	AppTag          string
-	IPFSMode        string
-	DataDir         string
-	PinataAPIKey    string
-	PinataSecretKey string
-	Port            string
-	GatewayPort     string
-	RefreshInterval time.Duration
-	MaxPinBytes     int64
+	HAFDatabaseURL     string
+	AppTag             string
+	IPFSMode           string
+	DataDir            string
+	PinataAPIKey       string
+	PinataSecretKey    string
+	Port               string
+	GatewayPort        string
+	RefreshInterval    time.Duration
+	MaxPinBytes        int64
+	AutoPinConcurrency int
+	AutoPinAuthorCap   int
 }
 
 func ParseConfig() (*Config, error) {
@@ -43,6 +52,8 @@ func ParseConfig() (*Config, error) {
 	gatewayPort := flag.String("gateway-port", "", "IPFS gateway port (embedded mode)")
 	refresh := flag.String("refresh", "", "Refresh interval (e.g. 1h, 30m)")
 	maxPinBytes := flag.String("max-pin-bytes", "", "Maximum bytes copied from a single gateway fetch (default 256 MiB)")
+	autoPinConcurrency := flag.String("autopin-concurrency", "", "Max in-flight autopin operations per discovery batch (default 4)")
+	autoPinAuthorCap := flag.String("autopin-author-cap", "", "Max CIDs pinned from any single Hive author per discovery batch (default 20)")
 
 	flag.Parse()
 
@@ -72,6 +83,8 @@ Environment variables (CLI flags override):
   GATEWAY_PORT         IPFS gateway port (default: 8080)
   REFRESH_INTERVAL     Re-query interval (default: 1h)
   MAX_PIN_BYTES        Max bytes per gateway fetch (default: 268435456 = 256 MiB)
+  AUTOPIN_CONCURRENCY  Max in-flight autopin operations per batch (default: 4)
+  AUTOPIN_AUTHOR_CAP   Max CIDs pinned per Hive author per discovery batch (default: 20)
 `)
 		return nil, fmt.Errorf("HAF_DATABASE_URL is required")
 	}
@@ -115,6 +128,30 @@ Environment variables (CLI flags override):
 		cfg.MaxPinBytes = n
 	}
 
+	// Autopin concurrency
+	concStr := envOrFlag("AUTOPIN_CONCURRENCY", *autoPinConcurrency, "")
+	if concStr == "" {
+		cfg.AutoPinConcurrency = defaultAutoPinConcurrency
+	} else {
+		n, err := strconv.Atoi(concStr)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid AUTOPIN_CONCURRENCY %q: must be a positive integer", concStr)
+		}
+		cfg.AutoPinConcurrency = n
+	}
+
+	// Autopin per-author cap
+	capStr := envOrFlag("AUTOPIN_AUTHOR_CAP", *autoPinAuthorCap, "")
+	if capStr == "" {
+		cfg.AutoPinAuthorCap = defaultAutoPinAuthorCap
+	} else {
+		n, err := strconv.Atoi(capStr)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("invalid AUTOPIN_AUTHOR_CAP %q: must be a positive integer", capStr)
+		}
+		cfg.AutoPinAuthorCap = n
+	}
+
 	// Validate mode
 	if cfg.IPFSMode != "embedded" && cfg.IPFSMode != "pinata" {
 		return nil, fmt.Errorf("IPFS_MODE must be 'embedded' or 'pinata', got %q", cfg.IPFSMode)
@@ -153,6 +190,8 @@ func (c *Config) LogConfig() {
 	fmt.Printf("  GATEWAY_PORT:      %s\n", c.GatewayPort)
 	fmt.Printf("  REFRESH_INTERVAL:  %s\n", c.RefreshInterval)
 	fmt.Printf("  MAX_PIN_BYTES:     %d (%.0f MiB)\n", c.MaxPinBytes, float64(c.MaxPinBytes)/float64(1<<20))
+	fmt.Printf("  AUTOPIN_CONCURRENCY: %d\n", c.AutoPinConcurrency)
+	fmt.Printf("  AUTOPIN_AUTHOR_CAP:  %d\n", c.AutoPinAuthorCap)
 	if c.IPFSMode == "pinata" {
 		if len(c.PinataAPIKey) >= 4 {
 			fmt.Printf("  PINATA_API_KEY:    %s***\n", c.PinataAPIKey[:4])

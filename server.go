@@ -36,23 +36,25 @@ type StatusResponse struct {
 
 // Server handles the management UI and API.
 type Server struct {
-	discovery *Discovery
-	backend   IPFSBackend
-	autopin   *AutoPinManager
-	startTime time.Time
-	refresh   time.Duration
-	mux       *http.ServeMux
+	discovery     *Discovery
+	backend       IPFSBackend
+	autopin       *AutoPinManager
+	autopinRunner *AutoPinRunner
+	startTime     time.Time
+	refresh       time.Duration
+	mux           *http.ServeMux
 }
 
 // NewServer creates the HTTP server with all routes.
-func NewServer(discovery *Discovery, backend IPFSBackend, autopin *AutoPinManager, refreshInterval time.Duration) *Server {
+func NewServer(discovery *Discovery, backend IPFSBackend, autopin *AutoPinManager, runner *AutoPinRunner, refreshInterval time.Duration) *Server {
 	s := &Server{
-		discovery: discovery,
-		backend:   backend,
-		autopin:   autopin,
-		startTime: time.Now(),
-		refresh:   refreshInterval,
-		mux:       http.NewServeMux(),
+		discovery:     discovery,
+		backend:       backend,
+		autopin:       autopin,
+		autopinRunner: runner,
+		startTime:     time.Now(),
+		refresh:       refreshInterval,
+		mux:           http.NewServeMux(),
 	}
 
 	// API routes
@@ -274,25 +276,14 @@ func (s *Server) handleDisableAllRules(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleEvaluateRules(w http.ResponseWriter, r *http.Request) {
 	items := s.discovery.Items()
-	cids := s.autopin.MatchingCIDs(items)
-	ctx := r.Context()
-
-	pinned := 0
-	failed := 0
-	for _, cid := range cids {
-		already, _ := s.backend.IsPinned(ctx, cid)
-		if already {
-			continue
-		}
-		if err := s.backend.Pin(ctx, cid); err != nil {
-			log.Printf("[autopin] failed to pin %s: %v", cid, err)
-			failed++
-		} else {
-			pinned++
-		}
-	}
-
-	writeJSON(w, map[string]int{"matched": len(cids), "pinned": pinned, "failed": failed})
+	matched := s.autopin.MatchingItems(items)
+	res := s.autopinRunner.Run(r.Context(), matched)
+	writeJSON(w, map[string]int{
+		"matched": res.Matched,
+		"pinned":  res.Pinned,
+		"failed":  res.Failed,
+		"shed":    res.Shed,
+	})
 }
 
 func writeJSON(w http.ResponseWriter, v interface{}) {

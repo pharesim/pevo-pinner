@@ -180,21 +180,23 @@ func (m *AutoPinManager) SetAllEnabled(enabled bool) error {
 	return m.saveLocked()
 }
 
-// MatchingCIDs returns CIDs from items that match at least one enabled rule.
-func (m *AutoPinManager) MatchingCIDs(items []DiscoveredItem) []string {
+// MatchingItems returns the items that match at least one enabled rule.
+// The full DiscoveredItem (not just the CID) is returned so the autopin
+// runner can apply per-author shedding before scheduling Pin calls.
+func (m *AutoPinManager) MatchingItems(items []DiscoveredItem) []DiscoveredItem {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	var cids []string
+	var matched []DiscoveredItem
 	for _, item := range items {
 		for _, rule := range m.rules {
 			if rule.Matches(item) {
-				cids = append(cids, item.CID)
+				matched = append(matched, item)
 				break
 			}
 		}
 	}
-	return cids
+	return matched
 }
 
 func newID() string {
