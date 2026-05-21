@@ -161,6 +161,7 @@ func (d *Discovery) refresh(ctx context.Context) error {
 
 	seen := make(map[string]bool)
 	var items []DiscoveredItem
+	var dropped int
 
 	for rows.Next() {
 		var (
@@ -179,17 +180,22 @@ func (d *Discovery) refresh(ctx context.Context) error {
 
 		// 1. Paper PDF CID
 		if ipfsCID.Valid && ipfsCID.String != "" && !seen[ipfsCID.String] {
-			seen[ipfsCID.String] = true
-			items = append(items, DiscoveredItem{
-				Author:     author,
-				Permlink:   permlink,
-				Title:      title,
-				CID:        ipfsCID.String,
-				Filename:   filename.String,
-				CIDType:    "paper",
-				Discipline: discipline.String,
-				Created:    created,
-			})
+			if err := ValidateCID(ipfsCID.String); err != nil {
+				dropped++
+				log.Printf("[discovery] dropped invalid paper CID by %s/%s: %v", author, permlink, err)
+			} else {
+				seen[ipfsCID.String] = true
+				items = append(items, DiscoveredItem{
+					Author:     author,
+					Permlink:   permlink,
+					Title:      title,
+					CID:        ipfsCID.String,
+					Filename:   filename.String,
+					CIDType:    "paper",
+					Discipline: discipline.String,
+					Created:    created,
+				})
+			}
 		}
 
 		// 2. Supplementary files
@@ -197,19 +203,25 @@ func (d *Discovery) refresh(ctx context.Context) error {
 			var suppFiles []SupplementaryFile
 			if err := json.Unmarshal([]byte(suppJSON.String), &suppFiles); err == nil {
 				for _, sf := range suppFiles {
-					if sf.CID != "" && !seen[sf.CID] {
-						seen[sf.CID] = true
-						items = append(items, DiscoveredItem{
-							Author:     author,
-							Permlink:   permlink,
-							Title:      title,
-							CID:        sf.CID,
-							Filename:   sf.Filename,
-							CIDType:    "supplementary",
-							Discipline: discipline.String,
-							Created:    created,
-						})
+					if sf.CID == "" || seen[sf.CID] {
+						continue
 					}
+					if err := ValidateCID(sf.CID); err != nil {
+						dropped++
+						log.Printf("[discovery] dropped invalid supplementary CID by %s/%s: %v", author, permlink, err)
+						continue
+					}
+					seen[sf.CID] = true
+					items = append(items, DiscoveredItem{
+						Author:     author,
+						Permlink:   permlink,
+						Title:      title,
+						CID:        sf.CID,
+						Filename:   sf.Filename,
+						CIDType:    "supplementary",
+						Discipline: discipline.String,
+						Created:    created,
+					})
 				}
 			}
 		}
@@ -219,18 +231,24 @@ func (d *Discovery) refresh(ctx context.Context) error {
 			matches := ipfsCIDRegex.FindAllStringSubmatch(body.String, -1)
 			for _, m := range matches {
 				cid := m[1]
-				if !seen[cid] {
-					seen[cid] = true
-					items = append(items, DiscoveredItem{
-						Author:     author,
-						Permlink:   permlink,
-						Title:      title,
-						CID:        cid,
-						CIDType:    "inline_image",
-						Discipline: discipline.String,
-						Created:    created,
-					})
+				if seen[cid] {
+					continue
 				}
+				if err := ValidateCID(cid); err != nil {
+					dropped++
+					log.Printf("[discovery] dropped invalid inline-image CID by %s/%s: %v", author, permlink, err)
+					continue
+				}
+				seen[cid] = true
+				items = append(items, DiscoveredItem{
+					Author:     author,
+					Permlink:   permlink,
+					Title:      title,
+					CID:        cid,
+					CIDType:    "inline_image",
+					Discipline: discipline.String,
+					Created:    created,
+				})
 			}
 		}
 	}
@@ -243,7 +261,11 @@ func (d *Discovery) refresh(ctx context.Context) error {
 	d.items = items
 	d.mu.Unlock()
 
-	log.Printf("[discovery] found %d CIDs", len(items))
+	if dropped > 0 {
+		log.Printf("[discovery] found %d CIDs (dropped %d invalid)", len(items), dropped)
+	} else {
+		log.Printf("[discovery] found %d CIDs", len(items))
+	}
 
 	if d.onRefresh != nil {
 		d.onRefresh(items)

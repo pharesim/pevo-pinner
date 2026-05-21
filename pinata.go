@@ -45,6 +45,9 @@ func (p *PinataBackend) doRequest(ctx context.Context, method, url string, body 
 }
 
 func (p *PinataBackend) Pin(ctx context.Context, cid string) error {
+	if err := ValidateCID(cid); err != nil {
+		return err
+	}
 	payload := map[string]string{"hashToPin": cid}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -67,6 +70,9 @@ func (p *PinataBackend) Pin(ctx context.Context, cid string) error {
 }
 
 func (p *PinataBackend) Unpin(ctx context.Context, cid string) error {
+	if err := ValidateCID(cid); err != nil {
+		return err
+	}
 	resp, err := p.doRequest(ctx, http.MethodDelete, pinataBaseURL+"/pinning/unpin/"+cid, nil)
 	if err != nil {
 		return fmt.Errorf("pinata unpin request: %w", err)
@@ -83,6 +89,9 @@ func (p *PinataBackend) Unpin(ctx context.Context, cid string) error {
 }
 
 func (p *PinataBackend) IsPinned(ctx context.Context, cid string) (bool, error) {
+	if err := ValidateCID(cid); err != nil {
+		return false, err
+	}
 	url := fmt.Sprintf("%s/data/pinList?status=pinned&hashContains=%s", pinataBaseURL, cid)
 	resp, err := p.doRequest(ctx, http.MethodGet, url, nil)
 	if err != nil {

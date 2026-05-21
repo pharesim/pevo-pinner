@@ -87,6 +87,9 @@ func (n *EmbeddedNode) blockPath(cid string) string {
 }
 
 func (n *EmbeddedNode) Pin(ctx context.Context, cid string) error {
+	if err := ValidateCID(cid); err != nil {
+		return err
+	}
 	// Check if already pinned and content exists
 	path := n.blockPath(cid)
 	if _, err := os.Stat(path); err == nil {
@@ -147,6 +150,9 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cid string) error {
 }
 
 func (n *EmbeddedNode) Unpin(_ context.Context, cid string) error {
+	if err := ValidateCID(cid); err != nil {
+		return err
+	}
 	n.mu.Lock()
 	delete(n.pins, cid)
 	n.mu.Unlock()
@@ -161,6 +167,9 @@ func (n *EmbeddedNode) Unpin(_ context.Context, cid string) error {
 }
 
 func (n *EmbeddedNode) IsPinned(_ context.Context, cid string) (bool, error) {
+	if err := ValidateCID(cid); err != nil {
+		return false, err
+	}
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.pins[cid], nil
