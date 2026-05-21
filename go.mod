@@ -1,4 +1,4 @@
-module pevo-pinner
+module github.com/pharesim/pevo-pinner
 
 go 1.25.0
 
