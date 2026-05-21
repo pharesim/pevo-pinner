@@ -30,11 +30,11 @@ func TestValidateCIDRejectsTraversalAndJunk(t *testing.T) {
 
 func TestEmbeddedNodeRejectsTraversalCID(t *testing.T) {
 	tmp := t.TempDir()
-	// gatewayPort "0" tells the OS to assign an ephemeral port. Every CID
+	// GatewayBind "127.0.0.1:0" picks a localhost ephemeral port. Every CID
 	// under test is rejected at ValidateCID before any block fetch happens.
 	node, err := NewEmbeddedNode(IPFSNodeOptions{
 		DataDir:      tmp,
-		GatewayPort:  "0",
+		GatewayBind:  "127.0.0.1:0",
 		Libp2pListen: []string{"/ip4/127.0.0.1/tcp/0"},
 	})
 	if err != nil {

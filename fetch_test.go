@@ -68,8 +68,9 @@ func TestFetchViaCARFailsClosedWithNoGateways(t *testing.T) {
 
 // TestFetchViaCARTriesGatewaysInOrder proves the chain is consulted in the
 // declared order: a 500 from the first gateway must fall through to the
-// second, not short-circuit. The brainstorm-stated ordering (PEvO main →
-// mesh → public) only holds if the chain actually walks past failures.
+// second, not short-circuit. The declared ordering (PEvO main → operator
+// extras → mesh → public defaults — see assembleFallbackChain) only holds
+// if the chain actually walks past failures.
 func TestFetchViaCARTriesGatewaysInOrder(t *testing.T) {
 	var order []string
 	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

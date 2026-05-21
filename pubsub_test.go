@@ -38,9 +38,9 @@ func TestHeartbeatRoundTripsJSON(t *testing.T) {
 
 // TestMeshEvictExpiredDropsStalePeers proves the cache eviction logic
 // honors the configured TTL — peers whose lastSeen is past the cutoff are
-// dropped, fresher peers are kept. This is what the brainstorm's "TTL >>
-// cadence" decision actually protects against: a one-time dropped heartbeat
-// must not evict a healthy peer.
+// dropped, fresher peers are kept. The TTL is sized larger than the
+// heartbeat cadence so a one-time dropped heartbeat does not evict a
+// healthy peer.
 func TestMeshEvictExpiredDropsStalePeers(t *testing.T) {
 	m := &meshManager{
 		ttl:   30 * time.Second,

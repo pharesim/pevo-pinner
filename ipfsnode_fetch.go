@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	bsnet "github.com/ipfs/boxo/bitswap/network/bsnet"
 	bsblockstore "github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/boxo/exchange"
+	blocks "github.com/ipfs/go-block-format"
 	cid "github.com/ipfs/go-cid"
 	carv2 "github.com/ipld/go-car/v2"
 	host "github.com/libp2p/go-libp2p/core/host"
@@ -23,15 +25,32 @@ import (
 // defaultFallbackGateways carries forward the public-gateway set used by the
 // prior HTTP-cache implementation. They serve as the tail of the CAR-fetch
 // fallback chain — only consulted after bitswap has timed out and any
-// operator-configured PEvO-main gateway / mesh peers (U5) have failed.
-// Trustless CAR transfer + boxo CAR import preserve the block-level
-// hash-verification property even against an arbitrary gateway.
+// operator-configured PEvO-main gateway / mesh-discovered pinner gateways
+// have failed. Trustless CAR transfer + boxo CAR import preserve the
+// block-level hash-verification property even against an arbitrary gateway.
 var defaultFallbackGateways = []string{
 	"https://ipfs.io",
 	"https://dweb.link",
 	"https://cloudflare-ipfs.com",
 	"https://gateway.pinata.cloud",
 }
+
+// perGatewayFetchTimeout bounds wall-clock per fallback-chain entry so a
+// gateway that accepts the TCP connection and then trickles bytes does not
+// hold the chain for the full http.Client.Timeout. The chain still respects
+// the caller's pinCtx as an outer bound.
+const perGatewayFetchTimeout = 90 * time.Second
+
+// defaultMaxPinBytes caps the total bytes accepted from any single CAR-fetch
+// response. The CAR parser hash-verifies every block so content authority is
+// preserved, but a hostile gateway can still attempt to fill disk with valid
+// blocks belonging to unrelated DAGs; this is the disk-fill DoS guard.
+const defaultMaxPinBytes = int64(1 << 30) // 1 GiB
+
+// carImportBatchSize is the number of CAR blocks accumulated before a single
+// PutMany call to flatfs. flatfs treats PutMany as a batched transaction so
+// fsync-per-block storms on large DAGs collapse to a single fsync per batch.
+const carImportBatchSize = 256
 
 // newBitswap wires bitswap onto the libp2p host with the DHT as its content
 // discovery layer and the local blockstore as its block store.
@@ -59,7 +78,10 @@ func (n *EmbeddedNode) fetchViaCAR(ctx context.Context, c cid.Cid) error {
 	}
 	var errs []error
 	for _, gw := range chain {
-		if err := n.fetchCARFromGateway(ctx, gw, c); err != nil {
+		gwCtx, gwCancel := context.WithTimeout(ctx, perGatewayFetchTimeout)
+		err := n.fetchCARFromGateway(gwCtx, gw, c)
+		gwCancel()
+		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", gw, err))
 			log.Printf("[ipfs] CAR fallback %s failed: %v", gw, err)
 			continue
@@ -74,6 +96,11 @@ func (n *EmbeddedNode) fetchViaCAR(ctx context.Context, c cid.Cid) error {
 // mesh-discovered pinner gateway URLs. Mesh entries are inserted between
 // the operator-supplied FALLBACK_GATEWAYS and the public defaults, so the
 // declared order remains: PEvO main → operator extras → mesh → public.
+//
+// The split point staticHeadLen is recorded at construction (it is the count
+// of non-default entries the operator supplied, PEvO main included) so this
+// function is O(N) on chain length and not vulnerable to a hostile operator
+// FALLBACK_GATEWAYS entry that happens to equal a default URL.
 func (n *EmbeddedNode) assembleFallbackChain() []string {
 	if n.mesh == nil {
 		return n.fallbackGateways
@@ -82,38 +109,22 @@ func (n *EmbeddedNode) assembleFallbackChain() []string {
 	if len(peers) == 0 {
 		return n.fallbackGateways
 	}
-	// Find the boundary between the static (PEvO + operator) head and the
-	// public-default tail of fallbackGateways so mesh URLs can be spliced
-	// in. The default set lives at the tail (NewEmbeddedNode composes the
-	// chain that way); compare against defaultFallbackGateways to find it.
-	headEnd := len(n.fallbackGateways)
-	for i := range n.fallbackGateways {
-		if i+len(defaultFallbackGateways) > len(n.fallbackGateways) {
-			break
-		}
-		match := true
-		for j, def := range defaultFallbackGateways {
-			if n.fallbackGateways[i+j] != def {
-				match = false
-				break
-			}
-		}
-		if match {
-			headEnd = i
-			break
-		}
+	headEnd := n.staticHeadLen
+	if headEnd > len(n.fallbackGateways) {
+		headEnd = len(n.fallbackGateways)
 	}
 
 	seen := make(map[string]struct{}, len(n.fallbackGateways)+len(peers))
 	out := make([]string, 0, len(n.fallbackGateways)+len(peers))
 	add := func(u string) {
-		if u == "" {
+		k := normalizeFallbackURL(u)
+		if k == "" {
 			return
 		}
-		if _, ok := seen[u]; ok {
+		if _, ok := seen[k]; ok {
 			return
 		}
-		seen[u] = struct{}{}
+		seen[k] = struct{}{}
 		out = append(out, u)
 	}
 	for _, u := range n.fallbackGateways[:headEnd] {
@@ -128,10 +139,33 @@ func (n *EmbeddedNode) assembleFallbackChain() []string {
 	return out
 }
 
+// normalizeFallbackURL collapses trailing-slash / case / default-port URL
+// variants to a single key for dedupe. Non-URL inputs return "" (treated as
+// a no-op by the caller).
+func normalizeFallbackURL(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return ""
+	}
+	u.Host = strings.ToLower(u.Host)
+	u.Path = strings.TrimRight(u.Path, "/")
+	u.Fragment = ""
+	u.RawQuery = ""
+	return u.String()
+}
+
 // fetchCARFromGateway streams a trustless CAR response from gw and writes
 // every block to the blockstore. The Accept header is the contract; servers
 // that ignore it and return reassembled UnixFS bytes are rejected at the CAR
 // parser. Hash verification per block is built into carv2's BlockReader.
+//
+// The response body is wrapped in a byte-counted limit reader bounded by
+// maxPinBytes+1 — exceeding the cap aborts the import with a clear error
+// rather than silently filling disk. Blocks are accumulated and flushed via
+// blockstore.PutMany to collapse per-block fsync storms on flatfs.
 func (n *EmbeddedNode) fetchCARFromGateway(ctx context.Context, gw string, c cid.Cid) error {
 	url := strings.TrimRight(gw, "/") + "/ipfs/" + c.String()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -153,11 +187,23 @@ func (n *EmbeddedNode) fetchCARFromGateway(ctx context.Context, gw string, c cid
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
 
-	br, err := carv2.NewBlockReader(resp.Body)
+	counter := &byteCountReader{r: io.LimitReader(resp.Body, n.maxPinBytes+1)}
+	br, err := carv2.NewBlockReader(counter)
 	if err != nil {
 		return fmt.Errorf("CAR header: %w", err)
 	}
 	var imported int
+	batch := make([]blocks.Block, 0, carImportBatchSize)
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+		if err := n.blockstore.PutMany(ctx, batch); err != nil {
+			return err
+		}
+		batch = batch[:0]
+		return nil
+	}
 	for {
 		blk, err := br.Next()
 		if err == io.EOF {
@@ -166,15 +212,38 @@ func (n *EmbeddedNode) fetchCARFromGateway(ctx context.Context, gw string, c cid
 		if err != nil {
 			return fmt.Errorf("CAR block %d: %w", imported, err)
 		}
-		if err := n.blockstore.Put(ctx, blk); err != nil {
-			return fmt.Errorf("blockstore put %s: %w", blk.Cid(), err)
+		if counter.n > n.maxPinBytes {
+			return fmt.Errorf("CAR stream exceeded MAX_PIN_BYTES (%d)", n.maxPinBytes)
 		}
+		batch = append(batch, blk)
 		imported++
+		if len(batch) >= carImportBatchSize {
+			if err := flush(); err != nil {
+				return fmt.Errorf("blockstore put-many: %w", err)
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return fmt.Errorf("blockstore put-many: %w", err)
 	}
 	if imported == 0 {
 		return errors.New("CAR stream contained no blocks")
 	}
 	return nil
+}
+
+// byteCountReader counts bytes read off the wrapped reader so the CAR import
+// can detect a stream that has exceeded its byte cap without relying on the
+// CAR parser to surface a clean error.
+type byteCountReader struct {
+	r io.Reader
+	n int64
+}
+
+func (b *byteCountReader) Read(p []byte) (int, error) {
+	n, err := b.r.Read(p)
+	b.n += int64(n)
+	return n, err
 }
 
 // newHTTPClient builds the HTTP client used for the CAR-fetch fallback. The

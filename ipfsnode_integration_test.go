@@ -79,7 +79,7 @@ func TestBitswapFetchFromPEvOMain(t *testing.T) {
 
 	node, err := NewEmbeddedNode(IPFSNodeOptions{
 		DataDir:            t.TempDir(),
-		GatewayPort:        "0",
+		GatewayBind:        "127.0.0.1:0",
 		Libp2pListen:       []string{"/ip4/127.0.0.1/tcp/0"},
 		PEvOMainLibp2pAddr: bootstrap,
 		BitswapTimeout:     30 * time.Second,

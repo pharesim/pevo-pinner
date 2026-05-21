@@ -47,7 +47,7 @@ func newTestEmbeddedNode(t *testing.T) *EmbeddedNode {
 	t.Helper()
 	node, err := NewEmbeddedNode(IPFSNodeOptions{
 		DataDir:     t.TempDir(),
-		GatewayPort: "0",
+		GatewayBind: "127.0.0.1:0",
 		// Localhost-only TCP keeps the test fast and quiet — libp2p's
 		// defaults bind to every interface on the box (slow on machines
 		// with Docker bridges, noisy in logs). The drain gate is the

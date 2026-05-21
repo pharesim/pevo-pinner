@@ -35,7 +35,7 @@ var ErrPinnerShuttingDown = errors.New("pinner: shutting down")
 // gateway guarantees the HTTP path never triggers a network fetch.
 type EmbeddedNode struct {
 	dataDir     string
-	gatewayPort string
+	gatewayBind string
 
 	// libp2p + routing.
 	host    host.Host
@@ -52,6 +52,22 @@ type EmbeddedNode struct {
 	// HTTP gateway (boxo handler).
 	server *http.Server
 
+	// Bitswap session bound + CAR-fetch fallback chain. On bitswap timeout
+	// the chain runs in order: configured head (PEvO main, then operator
+	// FALLBACK_GATEWAYS) → mesh-discovered pinner gateway URLs (spliced in
+	// at staticHeadLen by assembleFallbackChain) → public defaults. Per-CAR
+	// import is capped at maxPinBytes to prevent a hostile gateway from
+	// filling disk with hash-valid-but-unrelated blocks.
+	bitswapTimeout   time.Duration
+	fallbackGateways []string
+	staticHeadLen    int
+	maxPinBytes      int64
+	httpClient       *http.Client
+
+	// Community pinner mesh. nil when MeshAppTag was empty.
+	mesh *meshManager
+
+	// --- pin-set zone (guarded by mu) ---
 	// Recursive-pin set persisted as pins.json. Maintained alongside the
 	// blockstore — keeps the data shape simple and the migration story
 	// trivial (no boxo pinset / GC interactions yet).
@@ -59,24 +75,12 @@ type EmbeddedNode struct {
 	pins    map[string]bool
 	pinFile string
 
-	// Per-Pin DAG-walk timeout (bitswap session). On timeout, the CAR-fetch
-	// fallback chain runs in order: fallbackGateways (PEvO main first if
-	// configured via the IPFSNodeOptions PEvOMainGatewayURL knob, then any
-	// operator-supplied FALLBACK_GATEWAYS, then defaultFallbackGateways).
-	// The mesh layer (if enabled) appends discovered pinners' gateway URLs
-	// to a per-Pin chain via meshGatewayURLs.
-	bitswapTimeout   time.Duration
-	fallbackGateways []string
-	httpClient       *http.Client
-
-	// Community pinner mesh. nil when MeshAppTag was empty.
-	mesh *meshManager
-
-	// Drain coordination. drainMu serializes the gate check + WaitGroup.Add
-	// in Pin with the close + Wait in Drain. done is closed exactly once via
-	// doneOnce; inFlight tracks in-flight Pins so Drain can wait. cancels
-	// holds a CancelFunc per in-flight Pin so Drain can force-cancel the
-	// bitswap session past its deadline.
+	// --- drain-coordination zone (guarded by drainMu) ---
+	// drainMu serializes the gate check + WaitGroup.Add in Pin with the
+	// close + Wait in Drain. done is closed exactly once via doneOnce;
+	// inFlight tracks in-flight Pins so Drain can wait. cancels holds a
+	// CancelFunc per in-flight Pin so Drain can force-cancel the bitswap
+	// session past its deadline.
 	drainMu   sync.Mutex
 	done      chan struct{}
 	doneOnce  sync.Once
@@ -89,8 +93,13 @@ type EmbeddedNode struct {
 // the common operator (random libp2p port, ~/.pevo-pinner repo, no anchor
 // peer). Explicit values override.
 type IPFSNodeOptions struct {
-	DataDir     string
-	GatewayPort string
+	DataDir string
+
+	// GatewayBind is the full host:port the boxo gateway binds. Empty
+	// defaults to "127.0.0.1:8080". Operators that want the gateway
+	// reachable from outside the host pass ":<port>" or "0.0.0.0:<port>"
+	// explicitly — opt-in to public exposure.
+	GatewayBind string
 
 	// libp2p listen multiaddrs. Empty means libp2p's default (random port).
 	Libp2pListen []string
@@ -100,7 +109,7 @@ type IPFSNodeOptions struct {
 	// fine but slower at startup.
 	PEvOMainLibp2pAddr string
 
-	// Per-Pin bitswap session timeout. Zero falls back to the default below.
+	// Per-Pin bitswap session timeout. Zero falls back to defaultBitswapTimeout.
 	BitswapTimeout time.Duration
 
 	// PEvO main HTTP gateway URL (trustless CAR endpoint). Empty means
@@ -112,6 +121,10 @@ type IPFSNodeOptions struct {
 	// the chain after PEvO main, before the default public gateways.
 	FallbackGateways []string
 
+	// MaxPinBytes caps the bytes accepted from any single CAR-fetch
+	// response. Zero falls back to defaultMaxPinBytes (1 GiB).
+	MaxPinBytes int64
+
 	// Community pinner mesh (libp2p pubsub) knobs. AppTag enables the mesh
 	// (typically the same APP_TAG used by HAF discovery). PublicGatewayURL
 	// is what other pinners learn from our heartbeats so they can chain
@@ -122,10 +135,18 @@ type IPFSNodeOptions struct {
 	MeshHeartbeatInterval time.Duration
 	MeshCacheTTL          time.Duration
 	MeshAdvertiseDisabled bool
+	MeshAllowPrivate      bool
 }
 
-// defaultBitswapTimeout: brainstorm-stated default. Tunable via BITSWAP_TIMEOUT.
+// defaultBitswapTimeout caps the bitswap leg per Pin so a CID with no
+// reachable provider times out cleanly and falls through to the CAR chain.
+// 60s gives bitswap time to walk a multi-block DAG on a cold DHT; tunable
+// via BITSWAP_TIMEOUT.
 const defaultBitswapTimeout = 60 * time.Second
+
+// defaultGatewayBind keeps the gateway loopback-only on fresh deploys —
+// operators must opt in to public exposure via GatewayBind.
+const defaultGatewayBind = "127.0.0.1:8080"
 
 // NewEmbeddedNode constructs the in-process IPFS node: opens the flatfs repo,
 // constructs the libp2p host + DHT, wires bitswap, and starts the HTTP gateway.
@@ -133,11 +154,14 @@ func NewEmbeddedNode(opts IPFSNodeOptions) (*EmbeddedNode, error) {
 	if opts.DataDir == "" {
 		return nil, errors.New("ipfs: DataDir is required")
 	}
-	if opts.GatewayPort == "" {
-		return nil, errors.New("ipfs: GatewayPort is required")
+	if opts.GatewayBind == "" {
+		opts.GatewayBind = defaultGatewayBind
 	}
 	if opts.BitswapTimeout == 0 {
 		opts.BitswapTimeout = defaultBitswapTimeout
+	}
+	if opts.MaxPinBytes == 0 {
+		opts.MaxPinBytes = defaultMaxPinBytes
 	}
 
 	repoDir := filepath.Join(opts.DataDir, "ipfs-repo")
@@ -171,19 +195,22 @@ func NewEmbeddedNode(opts IPFSNodeOptions) (*EmbeddedNode, error) {
 	onlineSvc := blockservice.New(bs, bsw)
 	offlineSvc := blockservice.New(bs, offlinexchange.Exchange(bs))
 
-	// Compose the fallback chain: PEvO main (if set) → operator extras →
-	// defaults. Deterministic ordering preserves the brainstorm-stated
-	// preference for the trusted anchor before generic public endpoints.
-	fallback := make([]string, 0, 1+len(opts.FallbackGateways)+len(defaultFallbackGateways))
+	// Compose the static head of the fallback chain (PEvO main first, then
+	// operator-supplied extras) and record its length so assembleFallbackChain
+	// can splice mesh entries between the head and the public defaults
+	// without re-deriving the boundary.
+	staticHead := make([]string, 0, 1+len(opts.FallbackGateways))
 	if opts.PEvOMainGatewayURL != "" {
-		fallback = append(fallback, opts.PEvOMainGatewayURL)
+		staticHead = append(staticHead, opts.PEvOMainGatewayURL)
 	}
-	fallback = append(fallback, opts.FallbackGateways...)
+	staticHead = append(staticHead, opts.FallbackGateways...)
+	fallback := make([]string, 0, len(staticHead)+len(defaultFallbackGateways))
+	fallback = append(fallback, staticHead...)
 	fallback = append(fallback, defaultFallbackGateways...)
 
 	node := &EmbeddedNode{
 		dataDir:          opts.DataDir,
-		gatewayPort:      opts.GatewayPort,
+		gatewayBind:      opts.GatewayBind,
 		host:             h,
 		dht:              dht,
 		dhtStop:          dhtStop,
@@ -196,6 +223,8 @@ func NewEmbeddedNode(opts IPFSNodeOptions) (*EmbeddedNode, error) {
 		pinFile:          filepath.Join(opts.DataDir, "pins.json"),
 		bitswapTimeout:   opts.BitswapTimeout,
 		fallbackGateways: fallback,
+		staticHeadLen:    len(staticHead),
+		maxPinBytes:      opts.MaxPinBytes,
 		httpClient:       newHTTPClient(),
 		done:             make(chan struct{}),
 		cancels:          make(map[uint64]context.CancelFunc),
@@ -213,12 +242,13 @@ func NewEmbeddedNode(opts IPFSNodeOptions) (*EmbeddedNode, error) {
 	// Community pinner mesh is opt-in via MeshAppTag — empty tag = mesh off.
 	if opts.MeshAppTag != "" {
 		mesh, err := startMesh(ctx, h, MeshOptions{
-			AppTag:       opts.MeshAppTag,
-			GatewayURL:   opts.MeshPublicGatewayURL,
-			Interval:     opts.MeshHeartbeatInterval,
-			CacheTTL:     opts.MeshCacheTTL,
-			AdvertiseOff: opts.MeshAdvertiseDisabled,
-		}, nil, nil)
+			AppTag:               opts.MeshAppTag,
+			GatewayURL:           opts.MeshPublicGatewayURL,
+			Interval:             opts.MeshHeartbeatInterval,
+			CacheTTL:             opts.MeshCacheTTL,
+			AdvertiseOff:         opts.MeshAdvertiseDisabled,
+			AllowPrivateGateways: opts.MeshAllowPrivate,
+		})
 		if err != nil {
 			log.Printf("[ipfs] mesh disabled: %v", err)
 		} else {
@@ -231,6 +261,7 @@ func NewEmbeddedNode(opts IPFSNodeOptions) (*EmbeddedNode, error) {
 		log.Printf("[ipfs]   listen: %s/p2p/%s", addr, h.ID())
 	}
 	log.Printf("[ipfs] bitswap timeout: %s", opts.BitswapTimeout)
+	log.Printf("[ipfs] max pin bytes: %d", opts.MaxPinBytes)
 
 	return node, nil
 }

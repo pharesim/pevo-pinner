@@ -12,9 +12,16 @@ import (
 )
 
 // startGateway wires boxo's HTTP gateway handler against the offline
-// blockservice (so HTTP traffic NEVER triggers a bitswap fetch — only
-// already-imported content is served, matching the brainstorm decision on
-// gateway scope). Path-style only; subdomain gateway out of scope.
+// blockservice so HTTP traffic never triggers a bitswap fetch. Combined with
+// the gatewayGuard pin-set check, the gateway serves only content that was
+// explicitly pinned by this pinner — not session-bleed blocks from a
+// neighbouring DAG or partial-CAR-import orphans. Path-style only; subdomain
+// gateway out of scope.
+//
+// The default bind is 127.0.0.1 so a fresh deploy is not an open IPFS gateway
+// reachable from the public internet. Operators that want the boxo gateway
+// reachable from outside the host set GatewayBind to ":<port>" or
+// "0.0.0.0:<port>".
 func (n *EmbeddedNode) startGateway() error {
 	backend, err := gateway.NewBlocksBackend(n.offlineSvc)
 	if err != nil {
@@ -37,7 +44,7 @@ func (n *EmbeddedNode) startGateway() error {
 	mux.Handle("/ipns/", n.gatewayGuard(boxoHandler))
 
 	n.server = &http.Server{
-		Addr:              ":" + n.gatewayPort,
+		Addr:              n.gatewayBind,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
@@ -47,7 +54,7 @@ func (n *EmbeddedNode) startGateway() error {
 		return fmt.Errorf("gateway listen: %w", err)
 	}
 	go func() {
-		log.Printf("[ipfs] gateway listening on :%s", n.gatewayPort)
+		log.Printf("[ipfs] gateway listening on %s", n.gatewayBind)
 		if err := n.server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("[ipfs] gateway error: %v", err)
 		}
@@ -55,10 +62,12 @@ func (n *EmbeddedNode) startGateway() error {
 	return nil
 }
 
-// gatewayGuard rejects malformed CIDs at the route boundary before they reach
-// boxo's handler. ValidateCID is the cheap defense-in-depth guard kept from
-// the prior implementation: shape validation rejects garbage inputs without
-// loading any DAG state.
+// gatewayGuard rejects malformed CIDs at the route boundary and enforces the
+// pinned-only contract for /ipfs/ requests: the requested root CID must be in
+// the pin set, otherwise 404. Without this check the offline blockservice
+// would serve any block ever imported by bitswap or a partial CAR-fetch.
+// ValidateCID is the cheap defense-in-depth shape check kept from the prior
+// implementation; the pin-set lookup is the semantic guarantee.
 func (n *EmbeddedNode) gatewayGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -85,6 +94,13 @@ func (n *EmbeddedNode) gatewayGuard(next http.Handler) http.Handler {
 		}
 		if err := ValidateCID(raw); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		n.mu.RLock()
+		pinned := n.pins[raw]
+		n.mu.RUnlock()
+		if !pinned {
+			http.Error(w, "not pinned", http.StatusNotFound)
 			return
 		}
 		next.ServeHTTP(w, r)

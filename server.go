@@ -244,11 +244,13 @@ func (s *Server) handleIPFSProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Embedded mode: redirect to the boxo gateway port (which serves the
+	// Embedded mode: redirect to the boxo gateway (which serves the
 	// reassembled UnixFS file end-to-end, including multi-block files).
 	target := "http://" + r.Host
 	if h, _, err := net.SplitHostPort(r.Host); err == nil {
-		target = "http://" + h + ":" + embedded.gatewayPort
+		if _, gwPort, splitErr := net.SplitHostPort(embedded.gatewayBind); splitErr == nil {
+			target = "http://" + h + ":" + gwPort
+		}
 	}
 	http.Redirect(w, r, target+r.URL.Path, http.StatusTemporaryRedirect)
 }

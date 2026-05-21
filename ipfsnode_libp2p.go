@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 
 	libp2p "github.com/libp2p/go-libp2p"
 	crypto "github.com/libp2p/go-libp2p/core/crypto"
@@ -66,7 +67,9 @@ func newLibp2pHost(ctx context.Context, repoDir string, listenAddrs []string, bo
 
 	// Bootstrap dial to PEvO main. Non-blocking: if PEvO main is offline the
 	// pinner still starts; the DHT bootstrap below + any future mesh peers
-	// can substitute.
+	// can substitute. A 30-second deadline keeps an unreachable bootstrap
+	// peer from holding the goroutine and a file descriptor for the kernel's
+	// full SYN-retry window (~2 minutes on Linux defaults).
 	if bootstrapAddr != "" {
 		go func() {
 			ai, err := addrInfoFromString(bootstrapAddr)
@@ -74,7 +77,9 @@ func newLibp2pHost(ctx context.Context, repoDir string, listenAddrs []string, bo
 				log.Printf("[ipfs] invalid PEVO_MAIN_LIBP2P_ADDR %q: %v", bootstrapAddr, err)
 				return
 			}
-			if err := h.Connect(ctx, *ai); err != nil {
+			dialCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if err := h.Connect(dialCtx, *ai); err != nil {
 				log.Printf("[ipfs] bootstrap dial failed: %v", err)
 				return
 			}
