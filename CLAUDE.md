@@ -106,13 +106,17 @@ Tasks live in `agents/docs/tasks/{pending,review,blocked}/<role>-<kebab-summary>
 - `/ce-compound` — Gated; capture only non-obvious learnings.
 - `/ce-commit` — Local checkpoint commits at natural seams.
 
+## Code Review Findings
+
+When running `/ce-code-review`, `/security-review`, or any review skill that produces findings, do NOT auto-create new task files under `agents/docs/tasks/`, do NOT silently apply fixes, and do NOT silently archive a `review/` task with unresolved findings. Surface findings as a single ranked list in chat (severity + file:line + one-line rationale) and wait for the user to triage which ones become tasks, which get fixed in place, and which get dismissed. If the review comes back clean, say so explicitly in chat before proceeding.
+
 ## Asking questions
 
 Default to execution, but pause and ask when:
 
 - Scope is ambiguous and more than one reasonable interpretation exists.
 - A decision is hard to reverse (dependency adds, breaking API changes, destructive operations).
-- Review findings need triage.
+- Review findings need triage (see "Code Review Findings" above).
 - A task description contradicts the code you're reading.
 
 ## Testing and building
