@@ -1,0 +1,20 @@
+# Build artifacts
+/pevo-pinner
+*.test
+*.out
+coverage.*
+
+# Local state and data directories
+.env
+.env.local
+data/
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Agent coordination (gitignored to match PEvO main convention; tasks/* lives in the tree but agents/ subdirs aren't tracked beyond docs)
+# The pevo-pinner repo tracks agents/docs/** as the coordination surface.
