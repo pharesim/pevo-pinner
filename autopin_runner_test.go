@@ -192,11 +192,8 @@ func TestAutoPinRunnerRespectsConcurrencyBound(t *testing.T) {
 	close(backend.gate)
 	<-done
 
-	if got := atomic.LoadInt32(&backend.maxInFlight); got > 4 {
-		t.Errorf("max in-flight Pin calls = %d, want <= 4", got)
-	}
-	if got := atomic.LoadInt32(&backend.maxInFlight); got < 1 {
-		t.Errorf("max in-flight Pin calls = %d, want >= 1 (no Pin ever scheduled?)", got)
+	if got := atomic.LoadInt32(&backend.maxInFlight); got != 4 {
+		t.Errorf("max in-flight Pin calls = %d, want exactly 4 (pool should saturate)", got)
 	}
 	if got := backend.pinCount(); got != 20 {
 		t.Errorf("Pin call count = %d, want 20", got)

@@ -79,7 +79,11 @@ func (r *AutoPinRunner) Run(ctx context.Context, items []DiscoveredItem) AutoPin
 		}
 	}
 
-	res := AutoPinResult{Matched: len(items), Shed: sumValues(shedByAuthor)}
+	shedTotal := 0
+	for _, n := range shedByAuthor {
+		shedTotal += n
+	}
+	res := AutoPinResult{Matched: len(items), Shed: shedTotal}
 	if len(queued) == 0 {
 		return res
 	}
@@ -123,12 +127,4 @@ schedule:
 	res.Pinned = pinned
 	res.Failed = failed
 	return res
-}
-
-func sumValues(m map[string]int) int {
-	s := 0
-	for _, v := range m {
-		s += v
-	}
-	return s
 }
