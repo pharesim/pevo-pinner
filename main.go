@@ -105,10 +105,23 @@ func main() {
 		log.Printf("HTTP server shutdown error: %v", err)
 	}
 
+	// Stop discovery before draining the backend so no fresh autopin callback
+	// queues more pins behind the drain barrier. discovery.Stop cancels the
+	// refresh ticker and closes the DB pool.
+	discovery.Stop()
+
+	// Drain in-flight pins under a hard timeout. Bounded so a frozen gateway
+	// can't wedge the process indefinitely; in-flight goroutines past the
+	// deadline are abandoned (the process is about to exit anyway).
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer drainCancel()
+	if err := backend.Drain(drainCtx); err != nil {
+		log.Printf("backend drain incomplete: %v", err)
+	}
+
 	if err := backend.Close(); err != nil {
 		log.Printf("IPFS backend close error: %v", err)
 	}
 
-	discovery.Stop()
 	log.Printf("shutdown complete")
 }

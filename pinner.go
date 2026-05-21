@@ -32,6 +32,13 @@ type IPFSBackend interface {
 	// PinnedCIDs returns all currently pinned CIDs.
 	PinnedCIDs(ctx context.Context) ([]string, error)
 
-	// Close shuts down the backend and releases resources.
+	// Drain stops accepting new Pin calls and waits for in-flight ones to
+	// complete, returning ctx.Err() if the deadline expires first. Must be
+	// called before Close so partial blocks from a half-finished pin don't
+	// linger on disk while the gateway server is torn down.
+	Drain(ctx context.Context) error
+
+	// Close shuts down the backend and releases resources. Callers should
+	// invoke Drain first; Close on its own does not wait for in-flight pins.
 	Close() error
 }

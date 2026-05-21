@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -17,6 +18,11 @@ import (
 	cid "github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
 )
+
+// ErrPinnerShuttingDown is returned by Pin once Drain or Close has been
+// invoked. Callers should treat it as a permanent rejection for the current
+// process lifetime, not a retryable error.
+var ErrPinnerShuttingDown = errors.New("pinner: shutting down")
 
 // Public IPFS gateways used to fetch content when pinning.
 var publicGateways = []string{
@@ -38,6 +44,17 @@ type EmbeddedNode struct {
 	pinFile string
 	server  *http.Server
 	client  *http.Client
+
+	// Drain coordination. drainMu serializes the gate check + WaitGroup.Add
+	// in Pin with the channel close + WaitGroup.Wait in Drain, so a fresh Pin
+	// cannot race a concurrent Wait (Go's race detector treats Add with a
+	// positive delta as racy against a concurrent Wait when the counter is
+	// zero). done is closed exactly once via doneOnce; inFlight tracks Pin
+	// calls so Drain can block until they finish.
+	drainMu  sync.Mutex
+	done     chan struct{}
+	doneOnce sync.Once
+	inFlight sync.WaitGroup
 }
 
 // NewEmbeddedNode creates an embedded IPFS node with local storage.
@@ -57,6 +74,7 @@ func NewEmbeddedNode(dataDir, gatewayPort string, maxPinBytes int64) (*EmbeddedN
 		client: &http.Client{
 			Timeout: 2 * time.Minute,
 		},
+		done: make(chan struct{}),
 	}
 
 	// Load existing pins (missing file on first run is expected)
@@ -94,9 +112,25 @@ func (n *EmbeddedNode) blockPath(cid string) string {
 }
 
 func (n *EmbeddedNode) Pin(ctx context.Context, cidStr string) error {
+	// Gate check + WaitGroup.Add under drainMu so Drain's signal-and-Wait
+	// sequence sees a stable counter. Once Drain has closed done, every
+	// subsequent Pin returns here without Add'ing, leaving Wait free to
+	// observe only the strictly-pre-Drain in-flight set.
+	n.drainMu.Lock()
+	select {
+	case <-n.done:
+		n.drainMu.Unlock()
+		return ErrPinnerShuttingDown
+	default:
+	}
+	n.inFlight.Add(1)
+	n.drainMu.Unlock()
+	defer n.inFlight.Done()
+
 	if err := ValidateCID(cidStr); err != nil {
 		return err
 	}
+
 	// Parse the CID once so each gateway attempt can hash-verify against the
 	// requested multihash. A malformed multihash here is a programmer error
 	// (ValidateCID's regex passed), so we surface it loudly instead of
@@ -232,10 +266,50 @@ func (n *EmbeddedNode) PinnedCIDs(_ context.Context) ([]string, error) {
 	return cids, nil
 }
 
+// Drain signals shutdown and blocks until every in-flight Pin returns or ctx
+// expires. After Drain has been entered, new Pin calls return
+// ErrPinnerShuttingDown immediately. Safe to call concurrently and more than
+// once; subsequent calls observe the same closed channel.
+func (n *EmbeddedNode) Drain(ctx context.Context) error {
+	// Close done under drainMu so any concurrent Pin's gate check sees a
+	// consistent state; once we drop the lock and start Wait, no fresh Add
+	// can sneak through.
+	n.drainMu.Lock()
+	n.signalDone()
+	n.drainMu.Unlock()
+
+	finished := make(chan struct{})
+	go func() {
+		n.inFlight.Wait()
+		close(finished)
+	}()
+
+	select {
+	case <-finished:
+		log.Printf("[ipfs] drain complete")
+		return nil
+	case <-ctx.Done():
+		log.Printf("[ipfs] drain timed out: %v", ctx.Err())
+		return ctx.Err()
+	}
+}
+
 func (n *EmbeddedNode) Close() error {
+	// Close still signals done so leaked in-flight pins observe shutdown the
+	// next time they reach the inner done-check. Drain remains the
+	// synchronous wait; Close on its own only tears down the gateway server.
+	n.signalDone()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return n.server.Shutdown(ctx)
+}
+
+func (n *EmbeddedNode) signalDone() {
+	n.doneOnce.Do(func() {
+		close(n.done)
+		log.Printf("[ipfs] pin acceptance stopped")
+	})
 }
 
 func (n *EmbeddedNode) handleGateway(w http.ResponseWriter, r *http.Request) {

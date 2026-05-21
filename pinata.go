@@ -150,6 +150,13 @@ func (p *PinataBackend) PinnedCIDs(ctx context.Context) ([]string, error) {
 	return allCIDs, nil
 }
 
+// Drain is a no-op for the Pinata backend: every Pin/Unpin/IsPinned call is a
+// standalone HTTP round-trip that already honors its own context. There is no
+// long-lived blockstore write to drain.
+func (p *PinataBackend) Drain(_ context.Context) error {
+	return nil
+}
+
 func (p *PinataBackend) Close() error {
 	return nil
 }
