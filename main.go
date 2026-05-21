@@ -72,7 +72,7 @@ func main() {
 	discovery.Start(ctx)
 
 	// Start management server
-	srv := NewServer(discovery, backend, autopin, runner, cfg.RefreshInterval)
+	srv := NewServer(discovery, backend, autopin, runner, cfg.RefreshInterval, cfg.MaxPinBytes, cfg.AutoPinConcurrency, cfg.AutoPinAuthorCap)
 	httpServer := &http.Server{
 		Addr:              "127.0.0.1:" + cfg.Port,
 		Handler:           srv,

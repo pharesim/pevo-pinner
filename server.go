@@ -26,35 +26,50 @@ type PaperResponse struct {
 	Pinned     bool      `json:"pinned"`
 }
 
-// StatusResponse is the JSON shape returned by /api/status.
+// StatusResponse is the JSON shape returned by /api/status. The configuration
+// fields surface the operator-tunable knobs so an operator (or agent) who did
+// not start the process can read back the enforced limits without parsing
+// startup logs.
 type StatusResponse struct {
-	TotalDiscovered int    `json:"total_discovered"`
-	PinnedCount     int    `json:"pinned_count"`
-	NextRefresh     string `json:"next_refresh"`
-	Mode            string `json:"mode"`
+	TotalDiscovered    int    `json:"total_discovered"`
+	PinnedCount        int    `json:"pinned_count"`
+	NextRefresh        string `json:"next_refresh"`
+	Mode               string `json:"mode"`
+	RefreshInterval    string `json:"refresh_interval"`
+	MaxPinBytes        int64  `json:"max_pin_bytes"`
+	AutoPinConcurrency int    `json:"autopin_concurrency"`
+	AutoPinAuthorCap   int    `json:"autopin_author_cap"`
 }
 
 // Server handles the management UI and API.
 type Server struct {
-	discovery     *Discovery
-	backend       IPFSBackend
-	autopin       *AutoPinManager
-	autopinRunner *AutoPinRunner
-	startTime     time.Time
-	refresh       time.Duration
-	mux           *http.ServeMux
+	discovery          *Discovery
+	backend            IPFSBackend
+	autopin            *AutoPinManager
+	autopinRunner      *AutoPinRunner
+	startTime          time.Time
+	refresh            time.Duration
+	maxPinBytes        int64
+	autoPinConcurrency int
+	autoPinAuthorCap   int
+	mode               string
+	mux                *http.ServeMux
 }
 
 // NewServer creates the HTTP server with all routes.
-func NewServer(discovery *Discovery, backend IPFSBackend, autopin *AutoPinManager, runner *AutoPinRunner, refreshInterval time.Duration) *Server {
+func NewServer(discovery *Discovery, backend IPFSBackend, autopin *AutoPinManager, runner *AutoPinRunner, refreshInterval time.Duration, maxPinBytes int64, autoPinConcurrency, autoPinAuthorCap int) *Server {
 	s := &Server{
-		discovery:     discovery,
-		backend:       backend,
-		autopin:       autopin,
-		autopinRunner: runner,
-		startTime:     time.Now(),
-		refresh:       refreshInterval,
-		mux:           http.NewServeMux(),
+		discovery:          discovery,
+		backend:            backend,
+		autopin:            autopin,
+		autopinRunner:      runner,
+		startTime:          time.Now(),
+		refresh:            refreshInterval,
+		maxPinBytes:        maxPinBytes,
+		autoPinConcurrency: autoPinConcurrency,
+		autoPinAuthorCap:   autoPinAuthorCap,
+		mode:               backendMode(backend),
+		mux:                http.NewServeMux(),
 	}
 
 	// API routes
@@ -154,21 +169,19 @@ func (s *Server) handleUnpin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePinAll(w http.ResponseWriter, r *http.Request) {
+	// Route through the autopin runner so the bounded pool, per-author cap,
+	// and IsPinned pre-check all apply to operator-triggered pin-all. The
+	// runner is shared with the discovery callback and evaluate-rules handler,
+	// so the global concurrency bound holds across all three callers.
 	items := s.discovery.Items()
-	ctx := r.Context()
-
-	pinned := 0
-	failed := 0
-	for _, item := range items {
-		if err := s.backend.Pin(ctx, item.CID); err != nil {
-			log.Printf("[api] pin-all: failed to pin %s: %v", item.CID, err)
-			failed++
-		} else {
-			pinned++
-		}
-	}
-
-	writeJSON(w, map[string]int{"pinned": pinned, "failed": failed})
+	res := s.autopinRunner.Run(r.Context(), items)
+	writeJSON(w, map[string]int{
+		"matched":          res.Matched,
+		"pinned":           res.Pinned,
+		"failed":           res.Failed,
+		"shed":             res.Shed,
+		"is_pinned_errors": res.IsPinnedErrors,
+	})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -186,10 +199,29 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	remaining := s.refresh - (elapsed % s.refresh)
 
 	writeJSON(w, StatusResponse{
-		TotalDiscovered: len(items),
-		PinnedCount:     pinnedCount,
-		NextRefresh:     formatDuration(remaining),
+		TotalDiscovered:    len(items),
+		PinnedCount:        pinnedCount,
+		NextRefresh:        formatDuration(remaining),
+		Mode:               s.mode,
+		RefreshInterval:    s.refresh.String(),
+		MaxPinBytes:        s.maxPinBytes,
+		AutoPinConcurrency: s.autoPinConcurrency,
+		AutoPinAuthorCap:   s.autoPinAuthorCap,
 	})
+}
+
+// backendMode returns the operator-facing tag for the active backend. Drives
+// StatusResponse.Mode so an agent or operator who did not start the process
+// can tell which backend is wired without parsing startup logs.
+func backendMode(b IPFSBackend) string {
+	switch b.(type) {
+	case *EmbeddedNode:
+		return "embedded"
+	case *PinataBackend:
+		return "pinata"
+	default:
+		return "unknown"
+	}
 }
 
 func (s *Server) handleIPFSProxy(w http.ResponseWriter, r *http.Request) {
@@ -279,10 +311,11 @@ func (s *Server) handleEvaluateRules(w http.ResponseWriter, r *http.Request) {
 	matched := s.autopin.MatchingItems(items)
 	res := s.autopinRunner.Run(r.Context(), matched)
 	writeJSON(w, map[string]int{
-		"matched": res.Matched,
-		"pinned":  res.Pinned,
-		"failed":  res.Failed,
-		"shed":    res.Shed,
+		"matched":          res.Matched,
+		"pinned":           res.Pinned,
+		"failed":           res.Failed,
+		"shed":             res.Shed,
+		"is_pinned_errors": res.IsPinnedErrors,
 	})
 }
 

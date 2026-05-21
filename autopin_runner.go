@@ -10,22 +10,29 @@ import (
 // AutoPinRunner schedules backend.Pin calls for a discovery batch through a
 // bounded goroutine pool, applying a per-author CID cap before scheduling so a
 // single hostile accredited author broadcasting many CIDs cannot monopolize
-// autopin capacity. Construct once and reuse across batches; Run is
-// safe for serial reuse, not for concurrent batches.
+// autopin capacity. The semaphore is a struct field so the concurrency bound
+// is global across callers: a discovery refresh and an operator-triggered
+// evaluate-rules invocation cannot together exceed `concurrency` in-flight
+// pins. Construct once and reuse across batches and concurrent callers.
 type AutoPinRunner struct {
 	backend     IPFSBackend
 	concurrency int
 	authorCap   int
+	sem         chan struct{}
 }
 
 // AutoPinResult reports per-batch counts. Matched is the total enabled-rule
 // match count before shedding; Pinned counts successful new pins; Failed
-// counts Pin call errors; Shed counts CIDs dropped by the per-author cap.
+// counts Pin call errors; Shed counts CIDs dropped by the per-author cap;
+// IsPinnedErrors counts CIDs skipped because the backend's IsPinned probe
+// returned an error (these are not counted as Failed because no Pin call was
+// attempted).
 type AutoPinResult struct {
-	Matched int
-	Pinned  int
-	Failed  int
-	Shed    int
+	Matched        int
+	Pinned         int
+	Failed         int
+	Shed           int
+	IsPinnedErrors int
 }
 
 // NewAutoPinRunner returns a runner with the given concurrency and per-author
@@ -42,6 +49,7 @@ func NewAutoPinRunner(backend IPFSBackend, concurrency, authorCap int) *AutoPinR
 		backend:     backend,
 		concurrency: concurrency,
 		authorCap:   authorCap,
+		sem:         make(chan struct{}, concurrency),
 	}
 }
 
@@ -49,10 +57,12 @@ func NewAutoPinRunner(backend IPFSBackend, concurrency, authorCap int) *AutoPinR
 // first. Excess CIDs from any author past the cap are shed before any Pin call
 // is made for that author's overflow, so a wedged backend on one author's
 // in-flight pins cannot push out other authors' work. Run blocks until every
-// dispatched goroutine completes (the pool drains before return) so successive
-// discovery batches don't overlap each other's in-flight pins. Returns even
-// if ctx is cancelled: scheduling stops, in-flight Pin calls see the
-// cancellation through their own ctx argument.
+// goroutine it dispatched completes (its own pool drains before return) so a
+// caller's batch does not overlap its own next batch. The semaphore is shared
+// across the runner instance, so concurrent callers (e.g. discovery callback
+// and HTTP evaluate-rules handler) collectively hold at most `concurrency`
+// in-flight pins. Returns even if ctx is cancelled: scheduling stops,
+// in-flight Pin calls see the cancellation through their own ctx argument.
 func (r *AutoPinRunner) Run(ctx context.Context, items []DiscoveredItem) AutoPinResult {
 	authorCount := make(map[string]int, 16)
 	shedByAuthor := make(map[string]int, 4)
@@ -88,10 +98,9 @@ func (r *AutoPinRunner) Run(ctx context.Context, items []DiscoveredItem) AutoPin
 		return res
 	}
 
-	sem := make(chan struct{}, r.concurrency)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
-	pinned, failed := 0, 0
+	pinned, failed, isPinnedErrors := 0, 0, 0
 
 schedule:
 	for _, item := range queued {
@@ -99,14 +108,26 @@ schedule:
 		select {
 		case <-ctx.Done():
 			break schedule
-		case sem <- struct{}{}:
+		case r.sem <- struct{}{}:
 		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer func() { <-r.sem }()
 
-			already, _ := r.backend.IsPinned(ctx, item.CID)
+			already, err := r.backend.IsPinned(ctx, item.CID)
+			if err != nil {
+				// A swallowed IsPinned error against PinataBackend (live HTTP
+				// GET) coerces the answer to "not pinned" and falls through to
+				// an unconditional Pin attempt — a pin storm against a backend
+				// that may already be under stress. Surface the error, skip
+				// the Pin call, and count it separately.
+				log.Printf("[autopin] IsPinned failed for %s: %v", item.CID, err)
+				mu.Lock()
+				isPinnedErrors++
+				mu.Unlock()
+				return
+			}
 			if already {
 				return
 			}
@@ -126,5 +147,6 @@ schedule:
 
 	res.Pinned = pinned
 	res.Failed = failed
+	res.IsPinnedErrors = isPinnedErrors
 	return res
 }

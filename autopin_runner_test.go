@@ -15,17 +15,18 @@ import (
 // fakeBackend records Pin calls and optionally blocks via the gate channel so
 // tests can pin a deterministic mid-flight state. Implements IPFSBackend.
 type fakeBackend struct {
-	mu           sync.Mutex
-	pinned       []string
-	gate         chan struct{} // closed = release Pin; nil = no gating
-	maxInFlight  int32
-	curInFlight  int32
-	failCIDs     map[string]bool
-	pinnedRemote map[string]bool
+	mu              sync.Mutex
+	pinned          []string
+	gate            chan struct{} // closed = release Pin; nil = no gating
+	maxInFlight     int32
+	curInFlight     int32
+	failCIDs        map[string]bool
+	pinnedRemote    map[string]bool
+	isPinnedErrCIDs map[string]bool // CIDs for which IsPinned returns an error
 }
 
 func newFakeBackend() *fakeBackend {
-	return &fakeBackend{pinnedRemote: map[string]bool{}}
+	return &fakeBackend{pinnedRemote: map[string]bool{}, isPinnedErrCIDs: map[string]bool{}}
 }
 
 func (b *fakeBackend) Pin(ctx context.Context, cid string) error {
@@ -59,6 +60,9 @@ func (b *fakeBackend) Unpin(ctx context.Context, cid string) error { return nil 
 func (b *fakeBackend) IsPinned(ctx context.Context, cid string) (bool, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.isPinnedErrCIDs[cid] {
+		return false, fmt.Errorf("fake IsPinned failure for %s", cid)
+	}
 	return b.pinnedRemote[cid], nil
 }
 func (b *fakeBackend) PinnedCIDs(ctx context.Context) ([]string, error) {
@@ -258,5 +262,85 @@ func TestAutoPinRunnerNonPositiveArgsClampToOne(t *testing.T) {
 	res := runner.Run(context.Background(), items)
 	if res.Pinned != 1 || res.Shed != 4 {
 		t.Errorf("res = %+v, want Pinned=1, Shed=4", res)
+	}
+}
+
+// TestAutoPinRunnerSkipsPinOnIsPinnedError proves that when IsPinned returns
+// an error, the runner does NOT fall through to call Pin. A swallowed error
+// against a live-HTTP IsPinned (e.g. Pinata 429/5xx) would otherwise produce
+// repeat Pin attempts every discovery cycle — a pin storm against a backend
+// already under stress.
+func TestAutoPinRunnerSkipsPinOnIsPinnedError(t *testing.T) {
+	buf := captureLog(t)
+	backend := newFakeBackend()
+	runner := NewAutoPinRunner(backend, 4, 50)
+
+	items := makeItems(t, "author", 5)
+	// Two CIDs trip the IsPinned error path; three are healthy.
+	backend.isPinnedErrCIDs[items[0].CID] = true
+	backend.isPinnedErrCIDs[items[2].CID] = true
+
+	res := runner.Run(context.Background(), items)
+
+	if got, want := backend.pinCount(), 3; got != want {
+		t.Errorf("Pin call count = %d, want %d (no Pin call should follow a failed IsPinned)", got, want)
+	}
+	if res.Pinned != 3 {
+		t.Errorf("res.Pinned = %d, want 3", res.Pinned)
+	}
+	if res.IsPinnedErrors != 2 {
+		t.Errorf("res.IsPinnedErrors = %d, want 2", res.IsPinnedErrors)
+	}
+	if res.Failed != 0 {
+		t.Errorf("res.Failed = %d, want 0 (skipped CIDs are not Failed; no Pin was attempted)", res.Failed)
+	}
+
+	logs := buf.String()
+	if !strings.Contains(logs, "IsPinned failed for "+items[0].CID) {
+		t.Errorf("logs missing IsPinned-failed line for %s\nfull log:\n%s", items[0].CID, logs)
+	}
+}
+
+// TestAutoPinRunnerConcurrentRunsShareBound proves the runner's concurrency
+// bound is global across callers. Two goroutines call Run on the same runner
+// instance with a gate held; the observed max-in-flight Pin count must equal
+// the configured bound, NOT 2×bound. This guards against a regression where
+// the semaphore lives as a stack local inside Run, which would let two
+// concurrent invocations effectively double the in-flight ceiling.
+func TestAutoPinRunnerConcurrentRunsShareBound(t *testing.T) {
+	captureLog(t)
+	backend := newFakeBackend()
+	backend.gate = make(chan struct{})
+
+	const concurrency = 4
+	runner := NewAutoPinRunner(backend, concurrency, 100)
+
+	// Two batches with distinct authors so neither batch trips the per-author
+	// cap; we want to observe the shared semaphore, not the per-author cap.
+	batchA := makeItems(t, "author-a", 20)
+	batchB := makeItems(t, "author-b", 20)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		runner.Run(context.Background(), batchA)
+	}()
+	go func() {
+		defer wg.Done()
+		runner.Run(context.Background(), batchB)
+	}()
+
+	// Give both runners time to saturate the shared semaphore. With the gate
+	// held, every started Pin call stays in-flight until release.
+	time.Sleep(50 * time.Millisecond)
+	close(backend.gate)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&backend.maxInFlight); got != concurrency {
+		t.Errorf("max in-flight Pin calls = %d, want exactly %d (shared semaphore should cap two concurrent Run calls to the configured bound)", got, concurrency)
+	}
+	if got := backend.pinCount(); got != 40 {
+		t.Errorf("Pin call count = %d, want 40 (all CIDs from both batches)", got)
 	}
 }
