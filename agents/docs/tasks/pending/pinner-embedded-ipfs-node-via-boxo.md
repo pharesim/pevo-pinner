@@ -52,6 +52,34 @@ Pinner agent: please run `/ce-brainstorm` before starting code work to refine th
 
 The reviews that surfaced the structural issue (audit `2026-04-21` + the architect's review of `28167cb6` on `2026-05-21`) treated three different symptoms — false-confidence verification, partial-file cleanup races, layering-order bugs — but the underlying disease is "EmbeddedNode pretends to be an IPFS node and is not." This task addresses the disease.
 
+## Brainstorm decisions (2026-05-21)
+
+Pinner brainstorm refined the five sub-decisions the Implementation notes flagged. Below is the scope the implementer should plan against; an implementation plan (file shape, dependency surface, test layout) is the next step via `/ce-plan` or direct `/ce-work` once the implementer is ready.
+
+**Sequencing.** Single-shot replacement. No interim hash-verify revert; no parallel coexistence as a third `IPFS_MODE`. The current HTTP-cache `EmbeddedNode` is removed wholesale when boxo lands. Accepted cost: embedded mode stays broken against real `ipfs add`-produced CIDs until boxo ships; operators who need a working pinner in the interim use `IPFS_MODE=pinata`.
+
+**Fetch path.** Bitswap is primary. On per-CID timeout (~60s default, tunable), fall back to a CAR-fetch chain (`Accept: application/vnd.ipld.car`) against a configurable list of trustless gateways. CAR import hash-verifies every block during transfer, so the fallback preserves the trustless trust model — no centralized-gateway trust is added.
+
+**PEvO main as the network anchor.** PEvO main acts as **both** a trusted bootstrap libp2p peer (dialed directly on startup so bitswap always has at least one guaranteed provider for any PEvO CID) AND the first entry in the CAR-fetch fallback chain. Defaults ship pointing at PEvO main's known production endpoints; operators can override and add additional community-pinner peers and gateways for chained discovery.
+
+**Community pinner mesh (auto-discovery).** Pinners advertise their presence on a libp2p pubsub topic namespaced per `APP_TAG` (so `pevo` and `pevotest` meshes stay separate). Heartbeats carry the pinner's libp2p peer ID and, optionally, its public gateway URL. Each pinner maintains a known-peers cache built from received heartbeats, dials those peers as additional bitswap providers, and chains their gateways into the CAR-fetch fallback list after PEvO main but ahead of generic public gateways. A community pinner that loses connectivity to PEvO main can still operate by routing through fellow pinners it has discovered. Heartbeat cadence, cache TTL, and an operator opt-out for the advertise side are tunable.
+
+**Blockstore.** flatfs (Kubo default — one file per block in sharded directories). Simple, inspectable with `ls`, easy backups, no compaction surprises. Sufficient for projected PEvO scale (papers in the low thousands, each ~10–100 blocks). Badger is rejected as default.
+
+**libp2p / NAT.** DHT **client** mode by default. The pinner queries the DHT and advertises its pinned content as a provider, but does NOT serve routing queries for the wider network — that's "good network citizen" work separable from the pinner's core job. NAT traversal is enabled aggressively (AutoNAT, UPnP / NAT-PMP, circuit relays) because **reachability**, not DHT mode, is the actual lever for offloading PEvO main when downloaders fetch content. Operators with public IPs can opt into server mode.
+
+**Migration.** None. Pre-launch, no installed base. The boxo IPFS repo lives at a new path under `<dataDir>/`; any legacy `<dataDir>/blocks/` from tester machines is left alone (operator deletes by hand if they care).
+
+**Gateway scope.** The pinner's public IPFS HTTP endpoint at `GATEWAY_PORT` serves only **pinned** content — no pull-through bitswap fetch for unpinned CIDs requested by external HTTP callers. Resource-control default; operators can opt in later if they want their pinner to act as a full public gateway.
+
+**Pin state.** Boxo's pinset replaces (or wraps) the current `pins.json` — one less hand-rolled state file. The atomic-write helper introduced for `pins.json` / `autopin.json` is retained for autopin rule storage.
+
+**Test fixtures.** The existing `cidForContent` synthetic-CID fixture is deleted or rewritten to derive real `ipfs add`-shape CIDs via boxo's UnixFS primitives. The fixture's reason for existing — making the structurally non-functional hash-verify pass in tests — disappears with the rewrite. Tests gated by build tag or env flag may exercise real DHT / bitswap; default `go test ./...` must remain offline-only.
+
+**Configuration knobs.** New env vars surface for PEvO main's libp2p multiaddr, PEvO main's gateway URL, libp2p listen port, and an extra fallback-gateway list. Naming follows the bare-prefix convention used elsewhere in the pinner config set.
+
+**Out of scope.** Two-step rollout (revert hash-verify first, boxo later); `IPFS_MODE=boxo` coexisting with HTTP-cache mode; badger blockstore; DHT server-mode default; pull-through public gateway; configurable chunker / block-size / CID-version; any change to Pinata mode; running a separate Kubo container or external IPFS service alongside the pinner binary.
+
 ## References
 
 - Empirical verification of the multihash mismatch: architect review session 2026-05-21 (`git diff a9091bc1^..28167cb6` review; CIDs `QmPZ9g...`, `QmTudJ...`, `bafkrei...` curl + multihash compared).
