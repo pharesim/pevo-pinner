@@ -50,3 +50,16 @@ Close the integrity loop end-to-end so that no leaked goroutine, no abandoned dr
 
 - `agents/docs/solutions/conventions/fetch-abort-controller-bounds-headers-only-2026-05-06.md` — documents the "full-call unbounded after headers" pattern. Explicitly scopes to "IPFS gateway wrappers in pinner code." Same root cause as defect #1 above.
 - The narrower drain-barrier mechanism that this task interacts with was archived under the prior pinner-shutdown-drain work; see `agents/docs/tasks-archive.md` for context when present, or `git log -- pinner/` for the implementing commit's diff.
+
+## Implementation note (pre-review)
+
+Items 1, 3, 4 are met. Item 2 ("hash-verify the os.Stat short-circuit") is replaced by **atomic block writes** (tmp + fsync + rename), which is strictly stronger for the partial-file threat: the canonical path is only reachable via the rename, which runs only after io.Copy and the existing multihash check both succeed, so a file at blockPath is fully-written by construction. The short-circuit becomes safe without any content-hash check.
+
+Item 5 ("test corrupts on-disk file and asserts next Pin detects the mismatch") is **deferred to the boxo task**. Rationale: detecting post-write hand-tampering requires content verification, but for the current HTTP-cache architecture the only available verification — sha256 of gateway-returned reassembled UnixFS bytes vs the CID's multihash digest — is structurally non-functional for real `ipfs add`-produced CIDs (the same root cause the boxo task documents for the existing fetch-path hash-verify; CLAUDE.md's Trust model section now formalizes the HTTP-cache mode's "no end-to-end verification" guarantee). A sidecar-hash defense (recording sha256 of the as-received body alongside the block) would work but adds code that conflicts with the boxo migration; the boxo rewrite's bitswap+CAR-import block-level verification by construction is the proper home for this defense and is already in scope there.
+
+Acceptance summary:
+- [x] Drain-cancellable Pin ctx (per-Pin cancel registered under drainMu; Drain force-cancels on deadline + small grace for cleanup).
+- [x] Partial-file containment via atomic block writes — replaces hash-verify short-circuit with structurally-stronger primitive.
+- [x] Atomic `pins.json` (and `autopin.json`, per CLAUDE.md State-files-must-be-atomic invariant) via shared `atomicWriteFile` helper.
+- [x] Test: slow gateway + drain timeout → no file at blockPath, no file at blockPath+".tmp".
+- [ ] Test: hand-tampering corruption detection — deferred to the boxo task per rationale above.

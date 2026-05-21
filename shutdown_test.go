@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -111,6 +113,93 @@ func TestEmbeddedNodeDrainTimesOutOnHungPin(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 1*time.Second {
 		t.Errorf("Drain took %v, want under 1s", elapsed)
+	}
+}
+
+// TestEmbeddedNodeDrainCancelsPinAndCleansPartialFiles proves Drain's hard
+// deadline force-cancels in-flight Pin ctxs so io.Copy unwinds, the tmp
+// file is removed by the per-Pin cleanup, and nothing remains at either the
+// canonical block path or the .tmp path. Without ctx propagation through
+// Pin, io.Copy would stay blocked on the underlying gateway read until the
+// http.Client timeout (2 min) or process exit; the deferred cleanup would
+// never run; the partial file would persist and be promoted to fully-pinned
+// on the next startup via the os.Stat short-circuit.
+func TestEmbeddedNodeDrainCancelsPinAndCleansPartialFiles(t *testing.T) {
+	expectedCID := cidForContent(t, []byte("payload the gateway will never finish sending"))
+
+	// Gateway sends a 200 + a partial body chunk, then hangs. The partial
+	// chunk lands in the .tmp file so the post-drain cleanup is verified
+	// to actually remove a file with content, not just an empty placeholder.
+	stopHandler := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("partial-bytes-on-the-wire "))
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-stopHandler
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(stopHandler) })
+	withGatewaysSet(t, []string{srv.URL})
+
+	tmp := t.TempDir()
+	node, err := NewEmbeddedNode(tmp, "0", 1<<20)
+	if err != nil {
+		t.Fatalf("NewEmbeddedNode: %v", err)
+	}
+	t.Cleanup(func() { _ = node.Close() })
+
+	pinDone := make(chan struct{})
+	go func() {
+		_ = node.Pin(context.Background(), expectedCID)
+		close(pinDone)
+	}()
+
+	// Wait for Pin to reach the io.Copy and write the partial chunk into
+	// the .tmp file before triggering drain.
+	tmpFile := filepath.Join(tmp, "blocks", expectedCID+".tmp")
+	if err := waitForFile(tmpFile, time.Second); err != nil {
+		t.Fatalf("tmp file never appeared: %v", err)
+	}
+
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer drainCancel()
+	if err := node.Drain(drainCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain err = %v, want DeadlineExceeded", err)
+	}
+
+	// Wait for Pin's deferred cleanup to fully run. Drain's post-cancel
+	// grace usually returns only after this completes, but guard against
+	// timing drift so the assertions below don't race.
+	select {
+	case <-pinDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Pin did not unwind within 2s after drain force-cancel")
+	}
+
+	blockFile := filepath.Join(tmp, "blocks", expectedCID)
+	if _, err := os.Stat(blockFile); !os.IsNotExist(err) {
+		t.Errorf("canonical block file at %s after drain timeout (stat err: %v)", blockFile, err)
+	}
+	if _, err := os.Stat(tmpFile); !os.IsNotExist(err) {
+		t.Errorf("tmp file at %s after drain timeout (stat err: %v)", tmpFile, err)
+	}
+}
+
+// waitForFile polls until the named file appears or the deadline elapses.
+// Used to synchronize tests on the moment the production code reaches a
+// disk write, avoiding a hardcoded sleep that races on slow CI.
+func waitForFile(path string, within time.Duration) error {
+	deadline := time.Now().Add(within)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return errors.New("file did not appear before deadline")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 

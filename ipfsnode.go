@@ -50,11 +50,17 @@ type EmbeddedNode struct {
 	// cannot race a concurrent Wait (Go's race detector treats Add with a
 	// positive delta as racy against a concurrent Wait when the counter is
 	// zero). done is closed exactly once via doneOnce; inFlight tracks Pin
-	// calls so Drain can block until they finish.
-	drainMu  sync.Mutex
-	done     chan struct{}
-	doneOnce sync.Once
-	inFlight sync.WaitGroup
+	// calls so Drain can block until they finish. cancels holds a CancelFunc
+	// per in-flight Pin so Drain can force-cancel them when its deadline
+	// expires; without this, the caller's long-lived ctx keeps io.Copy
+	// blocked on the underlying gateway read past the drain budget and the
+	// per-Pin tmp-file cleanup defer never runs.
+	drainMu   sync.Mutex
+	done      chan struct{}
+	doneOnce  sync.Once
+	inFlight  sync.WaitGroup
+	cancels   map[uint64]context.CancelFunc
+	nextPinID uint64
 }
 
 // NewEmbeddedNode creates an embedded IPFS node with local storage.
@@ -74,7 +80,8 @@ func NewEmbeddedNode(dataDir, gatewayPort string, maxPinBytes int64) (*EmbeddedN
 		client: &http.Client{
 			Timeout: 2 * time.Minute,
 		},
-		done: make(chan struct{}),
+		done:    make(chan struct{}),
+		cancels: make(map[uint64]context.CancelFunc),
 	}
 
 	// Load existing pins (missing file on first run is expected)
@@ -112,10 +119,15 @@ func (n *EmbeddedNode) blockPath(cid string) string {
 }
 
 func (n *EmbeddedNode) Pin(ctx context.Context, cidStr string) error {
-	// Gate check + WaitGroup.Add under drainMu so Drain's signal-and-Wait
-	// sequence sees a stable counter. Once Drain has closed done, every
+	// Gate check + WaitGroup.Add + per-Pin cancel registration under
+	// drainMu so Drain's signal-and-Wait sequence sees a stable counter
+	// and a complete cancels map. Once Drain has closed done, every
 	// subsequent Pin returns here without Add'ing, leaving Wait free to
-	// observe only the strictly-pre-Drain in-flight set.
+	// observe only the strictly-pre-Drain in-flight set. pinCtx wraps the
+	// caller ctx so Drain can force-cancel mid-io.Copy on hard-deadline
+	// expiry; without this, the caller's long-lived ctx keeps the gateway
+	// read blocked past the drain budget and the tmp-file cleanup never
+	// runs, allowing a partial file to be promoted at next startup.
 	n.drainMu.Lock()
 	select {
 	case <-n.done:
@@ -124,8 +136,18 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cidStr string) error {
 	default:
 	}
 	n.inFlight.Add(1)
+	n.nextPinID++
+	pinID := n.nextPinID
+	pinCtx, pinCancel := context.WithCancel(ctx)
+	n.cancels[pinID] = pinCancel
 	n.drainMu.Unlock()
-	defer n.inFlight.Done()
+	defer func() {
+		n.drainMu.Lock()
+		delete(n.cancels, pinID)
+		n.drainMu.Unlock()
+		pinCancel()
+		n.inFlight.Done()
+	}()
 
 	if err := ValidateCID(cidStr); err != nil {
 		return err
@@ -144,7 +166,13 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cidStr string) error {
 		return fmt.Errorf("decoding multihash for %s: %w", cidStr, err)
 	}
 
-	// Check if already pinned and content exists
+	// Already pinned: the canonical block path only exists after a prior
+	// Pin completed the atomic rename below, so a file here is fully
+	// written by construction. Legacy files predating the atomic-write
+	// invariant are trusted on a best-effort basis (single-binary
+	// HTTP-cache mode does not hash-verify reassembled UnixFS bytes
+	// against the CID's multihash digest — trustless verification is the
+	// boxo rewrite's contract).
 	path := n.blockPath(cidStr)
 	if _, err := os.Stat(path); err == nil {
 		n.mu.Lock()
@@ -154,11 +182,18 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cidStr string) error {
 		return nil
 	}
 
+	// Atomic block write: stream into <cid>.tmp, fsync, then rename to
+	// canonical path. A partial copy (network failure, drain force-cancel,
+	// kill -9) only ever lives at the tmp path and is removed on the
+	// error branch; the canonical path is reachable only via the rename,
+	// which runs only after io.Copy + hash-verify both succeed.
+	tmpPath := path + ".tmp"
+
 	// Fetch from public gateways
 	var lastErr error
 	for _, gw := range publicGateways {
 		url := fmt.Sprintf("%s/ipfs/%s", gw, cidStr)
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(pinCtx, http.MethodGet, url, nil)
 		if err != nil {
 			lastErr = err
 			continue
@@ -184,39 +219,54 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cidStr string) error {
 			return fmt.Errorf("unsupported multihash code %d for %s: %w", expected.Code, cidStr, err)
 		}
 
-		// Write to local storage
-		f, err := os.Create(path)
+		f, err := os.Create(tmpPath)
 		if err != nil {
 			resp.Body.Close()
-			return fmt.Errorf("creating block file: %w", err)
+			return fmt.Errorf("creating block tmp file: %w", err)
 		}
 
 		// Layering: LimitedReader bounds the byte count first (so a hostile
 		// gateway streaming gigabytes does not exhaust memory through the
 		// hasher); TeeReader fans the bounded stream into the hasher; Copy
-		// writes the file from the tee.
+		// writes the tmp file from the tee.
 		lr := &io.LimitedReader{R: resp.Body, N: n.maxPinBytes + 1}
 		tee := io.TeeReader(lr, hasher)
-		_, err = io.Copy(f, tee)
+		_, copyErr := io.Copy(f, tee)
+		syncErr := f.Sync()
 		resp.Body.Close()
-		f.Close()
-		if err != nil {
-			os.Remove(path)
-			lastErr = fmt.Errorf("writing block: %w", err)
+		closeErr := f.Close()
+		if copyErr != nil {
+			_ = os.Remove(tmpPath)
+			lastErr = fmt.Errorf("writing block: %w", copyErr)
+			continue
+		}
+		if syncErr != nil {
+			_ = os.Remove(tmpPath)
+			lastErr = fmt.Errorf("syncing block: %w", syncErr)
+			continue
+		}
+		if closeErr != nil {
+			_ = os.Remove(tmpPath)
+			lastErr = fmt.Errorf("closing block: %w", closeErr)
 			continue
 		}
 		if lr.N == 0 {
-			os.Remove(path)
+			_ = os.Remove(tmpPath)
 			lastErr = fmt.Errorf("gateway %s response exceeded size cap of %d bytes", gw, n.maxPinBytes)
 			continue
 		}
 
 		actual := hasher.Sum(nil)
 		if !bytes.Equal(actual, expected.Digest) {
-			os.Remove(path)
+			_ = os.Remove(tmpPath)
 			lastErr = fmt.Errorf("gateway %s content hash mismatch for %s: expected %x, got %x", gw, cidStr, expected.Digest, actual)
 			log.Printf("[ipfs] %v", lastErr)
 			continue
+		}
+
+		if err := os.Rename(tmpPath, path); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("promoting block to canonical path: %w", err)
 		}
 
 		n.mu.Lock()
@@ -268,8 +318,12 @@ func (n *EmbeddedNode) PinnedCIDs(_ context.Context) ([]string, error) {
 
 // Drain signals shutdown and blocks until every in-flight Pin returns or ctx
 // expires. After Drain has been entered, new Pin calls return
-// ErrPinnerShuttingDown immediately. Safe to call concurrently and more than
-// once; subsequent calls observe the same closed channel.
+// ErrPinnerShuttingDown immediately. On hard-deadline expiry Drain
+// force-cancels every in-flight Pin's child ctx so io.Copy unwinds and the
+// per-Pin tmp-file cleanup runs before the process exits; a brief grace
+// window after force-cancel lets those deferred cleanups complete. Safe to
+// call concurrently and more than once; subsequent calls observe the same
+// closed channel.
 func (n *EmbeddedNode) Drain(ctx context.Context) error {
 	// Close done under drainMu so any concurrent Pin's gate check sees a
 	// consistent state; once we drop the lock and start Wait, no fresh Add
@@ -289,7 +343,27 @@ func (n *EmbeddedNode) Drain(ctx context.Context) error {
 		log.Printf("[ipfs] drain complete")
 		return nil
 	case <-ctx.Done():
-		log.Printf("[ipfs] drain timed out: %v", ctx.Err())
+		// Hard deadline: force-cancel every in-flight Pin so its
+		// io.Copy unwinds and the tmp-file cleanup defer runs. Then
+		// wait briefly for cleanups to complete; this is bounded so a
+		// truly stuck goroutine cannot wedge shutdown indefinitely.
+		n.drainMu.Lock()
+		pending := len(n.cancels)
+		for _, cancel := range n.cancels {
+			cancel()
+		}
+		n.drainMu.Unlock()
+		if pending > 0 {
+			log.Printf("[ipfs] drain deadline hit, force-cancelled %d in-flight pin(s): %v", pending, ctx.Err())
+		} else {
+			log.Printf("[ipfs] drain timed out with no in-flight pins to cancel: %v", ctx.Err())
+		}
+		select {
+		case <-finished:
+			log.Printf("[ipfs] post-cancel cleanup complete")
+		case <-time.After(2 * time.Second):
+			log.Printf("[ipfs] post-cancel cleanup grace expired; some tmp files may remain")
+		}
 		return ctx.Err()
 	}
 }
@@ -375,7 +449,7 @@ func (n *EmbeddedNode) savePins() {
 		log.Printf("[ipfs] failed to marshal pins: %v", err)
 		return
 	}
-	if err := os.WriteFile(n.pinFile, data, 0o644); err != nil {
+	if err := atomicWriteFile(n.pinFile, data, 0o644); err != nil {
 		log.Printf("[ipfs] failed to save pins: %v", err)
 	}
 }

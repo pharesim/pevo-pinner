@@ -212,7 +212,7 @@ func (m *AutoPinManager) saveLocked() error {
 	if err != nil {
 		return fmt.Errorf("marshaling autopin rules: %w", err)
 	}
-	if err := os.WriteFile(m.filePath, data, 0o644); err != nil {
+	if err := atomicWriteFile(m.filePath, data, 0o644); err != nil {
 		return fmt.Errorf("writing autopin rules: %w", err)
 	}
 	return nil
