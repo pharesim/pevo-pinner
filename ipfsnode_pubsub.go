@@ -165,10 +165,16 @@ func startMesh(parent context.Context, h host.Host, opts MeshOptions) (*meshMana
 // blocks until the goroutines unwind. Safe to call more than once.
 func (m *meshManager) Stop() {
 	m.stopOnce.Do(func() {
-		m.cancel()
-		m.sub.Cancel()
+		if m.cancel != nil {
+			m.cancel()
+		}
+		if m.sub != nil {
+			m.sub.Cancel()
+		}
 		m.wg.Wait()
-		_ = m.topic.Close()
+		if m.topic != nil {
+			_ = m.topic.Close()
+		}
 	})
 }
 
@@ -210,7 +216,7 @@ func (m *meshManager) recvLoop(ctx context.Context) {
 // multiaddrs and gateway URL. hb.GatewayURL is scheme/host-validated to
 // prevent SSRF when assembleFallbackChain later splices it into HTTP fetches.
 func (m *meshManager) applyHeartbeat(ctx context.Context, sender peer.ID, hb heartbeat) {
-	if sender == m.host.ID() {
+	if m.host != nil && sender == m.host.ID() {
 		return
 	}
 	// Reject impersonation outright: if the publisher claimed a peer ID at
@@ -267,7 +273,7 @@ func (m *meshManager) applyHeartbeat(ctx context.Context, sender peer.ID, hb hea
 		// Best-effort dial: feed bitswap a fresh provider. Tracked in wg so
 		// Stop waits for the dial to unwind rather than leaving a goroutine
 		// dereferencing m.host concurrently with h.Close.
-		if len(addrs) > 0 {
+		if m.host != nil && len(addrs) > 0 {
 			m.wg.Add(1)
 			dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			go func() {

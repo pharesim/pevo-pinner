@@ -84,6 +84,7 @@ type EmbeddedNode struct {
 	drainMu   sync.Mutex
 	done      chan struct{}
 	doneOnce  sync.Once
+	closeOnce sync.Once
 	inFlight  sync.WaitGroup
 	cancels   map[uint64]context.CancelFunc
 	nextPinID uint64
@@ -421,20 +422,23 @@ func (n *EmbeddedNode) Drain(ctx context.Context) error {
 
 // Close tears down the gateway server, blockstore, libp2p host, and DHT. Drain
 // should be called first; Close on its own does not wait for in-flight pins.
+// Idempotent — subsequent calls are no-ops and return nil.
 func (n *EmbeddedNode) Close() error {
-	n.signalDone()
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
 	var firstErr error
-	if n.server != nil {
-		if err := n.server.Shutdown(shutdownCtx); err != nil {
+	n.closeOnce.Do(func() {
+		n.signalDone()
+
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if n.server != nil {
+			if err := n.server.Shutdown(shutdownCtx); err != nil {
+				firstErr = err
+			}
+		}
+		if err := n.shutdownInternals(); err != nil && firstErr == nil {
 			firstErr = err
 		}
-	}
-	if err := n.shutdownInternals(); err != nil && firstErr == nil {
-		firstErr = err
-	}
+	})
 	return firstErr
 }
 

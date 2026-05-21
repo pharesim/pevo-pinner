@@ -206,10 +206,17 @@ func (n *EmbeddedNode) fetchCARFromGateway(ctx context.Context, gw string, c cid
 	}
 	for {
 		blk, err := br.Next()
-		if err == io.EOF {
-			break
-		}
 		if err != nil {
+			// A clean EOF means the CAR ended; anything else with the byte
+			// counter past the cap is the LimitReader having truncated the
+			// stream mid-section. Surface that as a clear cap error rather
+			// than the parser's "unexpected EOF".
+			if counter.n > n.maxPinBytes {
+				return fmt.Errorf("CAR stream exceeded MAX_PIN_BYTES (%d)", n.maxPinBytes)
+			}
+			if err == io.EOF {
+				break
+			}
 			return fmt.Errorf("CAR block %d: %w", imported, err)
 		}
 		if counter.n > n.maxPinBytes {
