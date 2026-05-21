@@ -59,8 +59,13 @@ type EmbeddedNode struct {
 	pins    map[string]bool
 	pinFile string
 
-	// Per-Pin DAG-walk timeout (bitswap session).
-	bitswapTimeout time.Duration
+	// Per-Pin DAG-walk timeout (bitswap session). On timeout, the CAR-fetch
+	// fallback chain runs in order: fallbackGateways (PEvO main first if
+	// configured via the IPFSNodeOptions PEvOMainGatewayURL knob, then any
+	// operator-supplied FALLBACK_GATEWAYS, then defaultFallbackGateways).
+	bitswapTimeout   time.Duration
+	fallbackGateways []string
+	httpClient       *http.Client
 
 	// Drain coordination. drainMu serializes the gate check + WaitGroup.Add
 	// in Pin with the close + Wait in Drain. done is closed exactly once via
@@ -92,6 +97,15 @@ type IPFSNodeOptions struct {
 
 	// Per-Pin bitswap session timeout. Zero falls back to the default below.
 	BitswapTimeout time.Duration
+
+	// PEvO main HTTP gateway URL (trustless CAR endpoint). Empty means
+	// no PEvO-main entry in the fallback chain — the chain falls back to
+	// operator-configured FALLBACK_GATEWAYS plus the default public set.
+	PEvOMainGatewayURL string
+
+	// Operator-supplied additional CAR-fetch gateway URLs. Inserted into
+	// the chain after PEvO main, before the default public gateways.
+	FallbackGateways []string
 }
 
 // defaultBitswapTimeout: brainstorm-stated default. Tunable via BITSWAP_TIMEOUT.
@@ -141,22 +155,34 @@ func NewEmbeddedNode(opts IPFSNodeOptions) (*EmbeddedNode, error) {
 	onlineSvc := blockservice.New(bs, bsw)
 	offlineSvc := blockservice.New(bs, offlinexchange.Exchange(bs))
 
+	// Compose the fallback chain: PEvO main (if set) → operator extras →
+	// defaults. Deterministic ordering preserves the brainstorm-stated
+	// preference for the trusted anchor before generic public endpoints.
+	fallback := make([]string, 0, 1+len(opts.FallbackGateways)+len(defaultFallbackGateways))
+	if opts.PEvOMainGatewayURL != "" {
+		fallback = append(fallback, opts.PEvOMainGatewayURL)
+	}
+	fallback = append(fallback, opts.FallbackGateways...)
+	fallback = append(fallback, defaultFallbackGateways...)
+
 	node := &EmbeddedNode{
-		dataDir:        opts.DataDir,
-		gatewayPort:    opts.GatewayPort,
-		host:           h,
-		dht:            dht,
-		dhtStop:        dhtStop,
-		rawDatastore:   dstore,
-		blockstore:     bs,
-		bitswap:        bsw,
-		bsBlockSvc:     onlineSvc,
-		offlineSvc:     offlineSvc,
-		pins:           make(map[string]bool),
-		pinFile:        filepath.Join(opts.DataDir, "pins.json"),
-		bitswapTimeout: opts.BitswapTimeout,
-		done:           make(chan struct{}),
-		cancels:        make(map[uint64]context.CancelFunc),
+		dataDir:          opts.DataDir,
+		gatewayPort:      opts.GatewayPort,
+		host:             h,
+		dht:              dht,
+		dhtStop:          dhtStop,
+		rawDatastore:     dstore,
+		blockstore:       bs,
+		bitswap:          bsw,
+		bsBlockSvc:       onlineSvc,
+		offlineSvc:       offlineSvc,
+		pins:             make(map[string]bool),
+		pinFile:          filepath.Join(opts.DataDir, "pins.json"),
+		bitswapTimeout:   opts.BitswapTimeout,
+		fallbackGateways: fallback,
+		httpClient:       newHTTPClient(),
+		done:             make(chan struct{}),
+		cancels:          make(map[uint64]context.CancelFunc),
 	}
 
 	if err := node.loadPins(); err != nil && !os.IsNotExist(err) {
@@ -215,22 +241,45 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cidStr string) error {
 		return fmt.Errorf("decoding CID %s: %w", cidStr, err)
 	}
 
-	// Fetch DAG via bitswap with a per-Pin timeout. merkledag.FetchGraph
-	// walks the dag-pb / UnixFS DAG and pulls every referenced block;
-	// bitswap hash-verifies each block against its CID on receipt.
-	fetchCtx, fetchCancel := context.WithTimeout(pinCtx, n.bitswapTimeout)
-	defer fetchCancel()
+	// Tier 1: bitswap. merkledag.FetchGraph walks the dag-pb / UnixFS DAG
+	// and pulls every referenced block; bitswap hash-verifies each block
+	// against its CID on receipt. Per-Pin timeout bounds the bitswap leg.
+	bswCtx, bswCancel := context.WithTimeout(pinCtx, n.bitswapTimeout)
 	dag := merkledag.NewDAGService(n.bsBlockSvc)
-	if err := merkledag.FetchGraph(fetchCtx, c, dag); err != nil {
-		return fmt.Errorf("fetching DAG for %s: %w", cidStr, err)
+	bswErr := merkledag.FetchGraph(bswCtx, c, dag)
+	bswCancel()
+	if bswErr == nil {
+		n.markPinned(cidStr)
+		log.Printf("[ipfs] pinned %s (bitswap)", cidStr)
+		return nil
 	}
 
+	// Tier 2/3: trustless CAR-fetch fallback chain. Each gateway is tried
+	// in order; boxo CAR import hash-verifies every block on read so a
+	// hostile gateway returning bad bytes is rejected at the parser.
+	// pinCtx (not bswCtx) bounds the fallback so the operator's outer
+	// ctx still applies, but the bitswap timeout no longer cuts us short.
+	if carErr := n.fetchViaCAR(pinCtx, c); carErr != nil {
+		return fmt.Errorf("fetching DAG for %s: bitswap: %w; CAR fallback: %v", cidStr, bswErr, carErr)
+	}
+	// CAR import populates the blockstore. Re-walk locally to confirm the
+	// graph is complete (CAR streams might be truncated; the second walk
+	// is offline-only and cheap when blocks are already on disk).
+	walkCtx, walkCancel := context.WithTimeout(pinCtx, 30*time.Second)
+	defer walkCancel()
+	if err := merkledag.FetchGraph(walkCtx, c, merkledag.NewDAGService(n.offlineSvc)); err != nil {
+		return fmt.Errorf("CAR-fetched DAG incomplete for %s: %w", cidStr, err)
+	}
+	n.markPinned(cidStr)
+	log.Printf("[ipfs] pinned %s (CAR fallback)", cidStr)
+	return nil
+}
+
+func (n *EmbeddedNode) markPinned(cidStr string) {
 	n.mu.Lock()
 	n.pins[cidStr] = true
 	n.mu.Unlock()
 	n.savePins()
-	log.Printf("[ipfs] pinned %s", cidStr)
-	return nil
 }
 
 func (n *EmbeddedNode) Unpin(_ context.Context, cidStr string) error {

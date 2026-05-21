@@ -36,6 +36,8 @@ type Config struct {
 	// the DHT's hardcoded seeds, brainstorm-stated bitswap timeout).
 	Libp2pListen       []string
 	PEvOMainLibp2pAddr string
+	PEvOMainGatewayURL string
+	FallbackGateways   []string
 	BitswapTimeout     time.Duration
 }
 
@@ -57,6 +59,8 @@ func ParseConfig() (*Config, error) {
 	autoPinAuthorCap := flag.String("autopin-author-cap", "", "Max CIDs pinned from any single Hive author per discovery batch (default 20)")
 	libp2pListen := flag.String("libp2p-listen", "", "Comma-separated libp2p listen multiaddrs (default: libp2p picks)")
 	pevoMainLibp2p := flag.String("pevo-main-libp2p-addr", "", "PEvO main libp2p multiaddr (bootstrap peer); empty = DHT-only bootstrap")
+	pevoMainGateway := flag.String("pevo-main-gateway-url", "", "PEvO main HTTP gateway URL (first CAR-fetch fallback entry); empty = no PEvO-main entry")
+	fallbackGw := flag.String("fallback-gateways", "", "Comma-separated extra CAR-fetch gateway URLs (inserted before the public defaults)")
 	bitswapTimeout := flag.String("bitswap-timeout", "", "Per-Pin bitswap fetch timeout (default 60s)")
 
 	flag.Parse()
@@ -90,6 +94,8 @@ Environment variables (CLI flags override):
   AUTOPIN_AUTHOR_CAP   Max CIDs pinned per Hive author per discovery batch (default: 20)
   LIBP2P_LISTEN        Comma-separated libp2p listen multiaddrs (default: libp2p picks)
   PEVO_MAIN_LIBP2P_ADDR  PEvO main libp2p multiaddr (default: empty)
+  PEVO_MAIN_GATEWAY_URL  PEvO main HTTP gateway URL for CAR fallback (default: empty)
+  FALLBACK_GATEWAYS    Comma-separated extra CAR-fetch gateways
   BITSWAP_TIMEOUT      Per-Pin bitswap timeout duration (default: 60s)
 `)
 		return nil, fmt.Errorf("HAF_DATABASE_URL is required")
@@ -158,6 +164,16 @@ Environment variables (CLI flags override):
 	}
 
 	cfg.PEvOMainLibp2pAddr = envOrFlag("PEVO_MAIN_LIBP2P_ADDR", *pevoMainLibp2p, "")
+	cfg.PEvOMainGatewayURL = envOrFlag("PEVO_MAIN_GATEWAY_URL", *pevoMainGateway, "")
+
+	if extra := envOrFlag("FALLBACK_GATEWAYS", *fallbackGw, ""); extra != "" {
+		for _, p := range strings.Split(extra, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				cfg.FallbackGateways = append(cfg.FallbackGateways, p)
+			}
+		}
+	}
 
 	// Bitswap per-Pin timeout
 	bswStr := envOrFlag("BITSWAP_TIMEOUT", *bitswapTimeout, "")
@@ -216,6 +232,12 @@ func (c *Config) LogConfig() {
 		}
 		if c.PEvOMainLibp2pAddr != "" {
 			fmt.Printf("  PEVO_MAIN_LIBP2P_ADDR: %s\n", c.PEvOMainLibp2pAddr)
+		}
+		if c.PEvOMainGatewayURL != "" {
+			fmt.Printf("  PEVO_MAIN_GATEWAY_URL: %s\n", c.PEvOMainGatewayURL)
+		}
+		if len(c.FallbackGateways) > 0 {
+			fmt.Printf("  FALLBACK_GATEWAYS: %s\n", strings.Join(c.FallbackGateways, ","))
 		}
 		if c.BitswapTimeout > 0 {
 			fmt.Printf("  BITSWAP_TIMEOUT:   %s\n", c.BitswapTimeout)

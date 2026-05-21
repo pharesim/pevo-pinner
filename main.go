@@ -47,6 +47,8 @@ func main() {
 			GatewayPort:        cfg.GatewayPort,
 			Libp2pListen:       cfg.Libp2pListen,
 			PEvOMainLibp2pAddr: cfg.PEvOMainLibp2pAddr,
+			PEvOMainGatewayURL: cfg.PEvOMainGatewayURL,
+			FallbackGateways:   cfg.FallbackGateways,
 			BitswapTimeout:     cfg.BitswapTimeout,
 		})
 		if err != nil {
