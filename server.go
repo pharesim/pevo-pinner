@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -36,7 +38,6 @@ type StatusResponse struct {
 	NextRefresh        string `json:"next_refresh"`
 	Mode               string `json:"mode"`
 	RefreshInterval    string `json:"refresh_interval"`
-	MaxPinBytes        int64  `json:"max_pin_bytes"`
 	AutoPinConcurrency int    `json:"autopin_concurrency"`
 	AutoPinAuthorCap   int    `json:"autopin_author_cap"`
 }
@@ -49,7 +50,6 @@ type Server struct {
 	autopinRunner      *AutoPinRunner
 	startTime          time.Time
 	refresh            time.Duration
-	maxPinBytes        int64
 	autoPinConcurrency int
 	autoPinAuthorCap   int
 	mode               string
@@ -57,7 +57,7 @@ type Server struct {
 }
 
 // NewServer creates the HTTP server with all routes.
-func NewServer(discovery *Discovery, backend IPFSBackend, autopin *AutoPinManager, runner *AutoPinRunner, refreshInterval time.Duration, maxPinBytes int64, autoPinConcurrency, autoPinAuthorCap int) *Server {
+func NewServer(discovery *Discovery, backend IPFSBackend, autopin *AutoPinManager, runner *AutoPinRunner, refreshInterval time.Duration, autoPinConcurrency, autoPinAuthorCap int) *Server {
 	s := &Server{
 		discovery:          discovery,
 		backend:            backend,
@@ -65,7 +65,6 @@ func NewServer(discovery *Discovery, backend IPFSBackend, autopin *AutoPinManage
 		autopinRunner:      runner,
 		startTime:          time.Now(),
 		refresh:            refreshInterval,
-		maxPinBytes:        maxPinBytes,
 		autoPinConcurrency: autoPinConcurrency,
 		autoPinAuthorCap:   autoPinAuthorCap,
 		mode:               backendMode(backend),
@@ -204,7 +203,6 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		NextRefresh:        formatDuration(remaining),
 		Mode:               s.mode,
 		RefreshInterval:    s.refresh.String(),
-		MaxPinBytes:        s.maxPinBytes,
 		AutoPinConcurrency: s.autoPinConcurrency,
 		AutoPinAuthorCap:   s.autoPinAuthorCap,
 	})
@@ -225,26 +223,34 @@ func backendMode(b IPFSBackend) string {
 }
 
 func (s *Server) handleIPFSProxy(w http.ResponseWriter, r *http.Request) {
-	// Extract CID from path
-	cid := r.URL.Path[len("/ipfs/"):]
-	if cid == "" {
+	// /ipfs/<cid>[/sub/path]. Extract just the CID for validation; the
+	// suffix is preserved when redirecting so directory and subpath
+	// requests round-trip correctly.
+	raw := r.URL.Path[len("/ipfs/"):]
+	cidPart, _, _ := strings.Cut(raw, "/")
+	if cidPart == "" {
 		http.Error(w, "missing CID", http.StatusBadRequest)
 		return
 	}
-	if err := ValidateCID(cid); err != nil {
+	if err := ValidateCID(cidPart); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	// Check if embedded node
 	embedded, ok := s.backend.(*EmbeddedNode)
 	if !ok {
-		// For pinata mode, redirect to a public gateway
-		http.Redirect(w, r, "https://gateway.pinata.cloud/ipfs/"+cid, http.StatusTemporaryRedirect)
+		// Pinata mode: no local gateway. Redirect to a public gateway.
+		http.Redirect(w, r, "https://gateway.pinata.cloud/ipfs/"+raw, http.StatusTemporaryRedirect)
 		return
 	}
 
-	embedded.handleGateway(w, r)
+	// Embedded mode: redirect to the boxo gateway port (which serves the
+	// reassembled UnixFS file end-to-end, including multi-block files).
+	target := "http://" + r.Host
+	if h, _, err := net.SplitHostPort(r.Host); err == nil {
+		target = "http://" + h + ":" + embedded.gatewayPort
+	}
+	http.Redirect(w, r, target+r.URL.Path, http.StatusTemporaryRedirect)
 }
 
 func (s *Server) handleGetRules(w http.ResponseWriter, r *http.Request) {

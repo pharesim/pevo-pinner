@@ -42,11 +42,16 @@ func main() {
 	var backend IPFSBackend
 	switch cfg.IPFSMode {
 	case "embedded":
-		backend, err = NewEmbeddedNode(cfg.DataDir, cfg.GatewayPort, cfg.MaxPinBytes)
+		backend, err = NewEmbeddedNode(IPFSNodeOptions{
+			DataDir:            cfg.DataDir,
+			GatewayPort:        cfg.GatewayPort,
+			Libp2pListen:       cfg.Libp2pListen,
+			PEvOMainLibp2pAddr: cfg.PEvOMainLibp2pAddr,
+			BitswapTimeout:     cfg.BitswapTimeout,
+		})
 		if err != nil {
 			log.Fatalf("initializing embedded IPFS node: %v", err)
 		}
-		log.Printf("embedded IPFS node started, gateway on :%s", cfg.GatewayPort)
 	case "pinata":
 		backend = NewPinataBackend(cfg.PinataAPIKey, cfg.PinataSecretKey)
 		log.Printf("using Pinata backend")
@@ -72,7 +77,7 @@ func main() {
 	discovery.Start(ctx)
 
 	// Start management server
-	srv := NewServer(discovery, backend, autopin, runner, cfg.RefreshInterval, cfg.MaxPinBytes, cfg.AutoPinConcurrency, cfg.AutoPinAuthorCap)
+	srv := NewServer(discovery, backend, autopin, runner, cfg.RefreshInterval, cfg.AutoPinConcurrency, cfg.AutoPinAuthorCap)
 	httpServer := &http.Server{
 		Addr:              "127.0.0.1:" + cfg.Port,
 		Handler:           srv,

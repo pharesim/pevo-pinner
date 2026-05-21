@@ -11,10 +11,6 @@ import (
 	"time"
 )
 
-// defaultMaxPinBytes caps a single gateway fetch at 256 MiB — well above any
-// realistic paper PDF or supplementary archive, well below disk-fill territory.
-const defaultMaxPinBytes int64 = 256 << 20
-
 // Autopin defaults: bounded worker pool + per-author cap defend the autopin
 // queue against a single hostile accredited author broadcasting many CIDs.
 const (
@@ -32,9 +28,15 @@ type Config struct {
 	Port               string
 	GatewayPort        string
 	RefreshInterval    time.Duration
-	MaxPinBytes        int64
 	AutoPinConcurrency int
 	AutoPinAuthorCap   int
+
+	// Embedded-node libp2p / fetch knobs. Empty values fall back to library
+	// defaults (libp2p picks a random listen port, no anchor peer beyond
+	// the DHT's hardcoded seeds, brainstorm-stated bitswap timeout).
+	Libp2pListen       []string
+	PEvOMainLibp2pAddr string
+	BitswapTimeout     time.Duration
 }
 
 func ParseConfig() (*Config, error) {
@@ -51,9 +53,11 @@ func ParseConfig() (*Config, error) {
 	port := flag.String("port", "", "Management UI port")
 	gatewayPort := flag.String("gateway-port", "", "IPFS gateway port (embedded mode)")
 	refresh := flag.String("refresh", "", "Refresh interval (e.g. 1h, 30m)")
-	maxPinBytes := flag.String("max-pin-bytes", "", "Maximum bytes copied from a single gateway fetch (default 256 MiB)")
 	autoPinConcurrency := flag.String("autopin-concurrency", "", "Max in-flight autopin operations per discovery batch (default 4)")
 	autoPinAuthorCap := flag.String("autopin-author-cap", "", "Max CIDs pinned from any single Hive author per discovery batch (default 20)")
+	libp2pListen := flag.String("libp2p-listen", "", "Comma-separated libp2p listen multiaddrs (default: libp2p picks)")
+	pevoMainLibp2p := flag.String("pevo-main-libp2p-addr", "", "PEvO main libp2p multiaddr (bootstrap peer); empty = DHT-only bootstrap")
+	bitswapTimeout := flag.String("bitswap-timeout", "", "Per-Pin bitswap fetch timeout (default 60s)")
 
 	flag.Parse()
 
@@ -82,9 +86,11 @@ Environment variables (CLI flags override):
   PORT                 Management UI port (default: 8421)
   GATEWAY_PORT         IPFS gateway port (default: 8080)
   REFRESH_INTERVAL     Re-query interval (default: 1h)
-  MAX_PIN_BYTES        Max bytes per gateway fetch (default: 268435456 = 256 MiB)
   AUTOPIN_CONCURRENCY  Max in-flight autopin operations per batch (default: 4)
   AUTOPIN_AUTHOR_CAP   Max CIDs pinned per Hive author per discovery batch (default: 20)
+  LIBP2P_LISTEN        Comma-separated libp2p listen multiaddrs (default: libp2p picks)
+  PEVO_MAIN_LIBP2P_ADDR  PEvO main libp2p multiaddr (default: empty)
+  BITSWAP_TIMEOUT      Per-Pin bitswap timeout duration (default: 60s)
 `)
 		return nil, fmt.Errorf("HAF_DATABASE_URL is required")
 	}
@@ -116,18 +122,6 @@ Environment variables (CLI flags override):
 	}
 	cfg.RefreshInterval = dur
 
-	// Max pin bytes
-	maxStr := envOrFlag("MAX_PIN_BYTES", *maxPinBytes, "")
-	if maxStr == "" {
-		cfg.MaxPinBytes = defaultMaxPinBytes
-	} else {
-		n, err := strconv.ParseInt(maxStr, 10, 64)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("invalid MAX_PIN_BYTES %q: must be a positive integer (bytes)", maxStr)
-		}
-		cfg.MaxPinBytes = n
-	}
-
 	// Autopin concurrency
 	concStr := envOrFlag("AUTOPIN_CONCURRENCY", *autoPinConcurrency, "")
 	if concStr == "" {
@@ -150,6 +144,29 @@ Environment variables (CLI flags override):
 			return nil, fmt.Errorf("invalid AUTOPIN_AUTHOR_CAP %q: must be a positive integer", capStr)
 		}
 		cfg.AutoPinAuthorCap = n
+	}
+
+	// libp2p listen multiaddrs (comma-separated)
+	listenStr := envOrFlag("LIBP2P_LISTEN", *libp2pListen, "")
+	if listenStr != "" {
+		for _, p := range strings.Split(listenStr, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" {
+				cfg.Libp2pListen = append(cfg.Libp2pListen, p)
+			}
+		}
+	}
+
+	cfg.PEvOMainLibp2pAddr = envOrFlag("PEVO_MAIN_LIBP2P_ADDR", *pevoMainLibp2p, "")
+
+	// Bitswap per-Pin timeout
+	bswStr := envOrFlag("BITSWAP_TIMEOUT", *bitswapTimeout, "")
+	if bswStr != "" {
+		d, err := time.ParseDuration(bswStr)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("invalid BITSWAP_TIMEOUT %q: %w", bswStr, err)
+		}
+		cfg.BitswapTimeout = d
 	}
 
 	// Validate mode
@@ -189,9 +206,23 @@ func (c *Config) LogConfig() {
 	fmt.Printf("  PORT:              %s\n", c.Port)
 	fmt.Printf("  GATEWAY_PORT:      %s\n", c.GatewayPort)
 	fmt.Printf("  REFRESH_INTERVAL:  %s\n", c.RefreshInterval)
-	fmt.Printf("  MAX_PIN_BYTES:     %d (%.0f MiB)\n", c.MaxPinBytes, float64(c.MaxPinBytes)/float64(1<<20))
 	fmt.Printf("  AUTOPIN_CONCURRENCY: %d\n", c.AutoPinConcurrency)
 	fmt.Printf("  AUTOPIN_AUTHOR_CAP:  %d\n", c.AutoPinAuthorCap)
+	if c.IPFSMode == "embedded" {
+		if len(c.Libp2pListen) > 0 {
+			fmt.Printf("  LIBP2P_LISTEN:     %s\n", strings.Join(c.Libp2pListen, ","))
+		} else {
+			fmt.Printf("  LIBP2P_LISTEN:     (libp2p default)\n")
+		}
+		if c.PEvOMainLibp2pAddr != "" {
+			fmt.Printf("  PEVO_MAIN_LIBP2P_ADDR: %s\n", c.PEvOMainLibp2pAddr)
+		}
+		if c.BitswapTimeout > 0 {
+			fmt.Printf("  BITSWAP_TIMEOUT:   %s\n", c.BitswapTimeout)
+		} else {
+			fmt.Printf("  BITSWAP_TIMEOUT:   (default)\n")
+		}
+	}
 	if c.IPFSMode == "pinata" {
 		if len(c.PinataAPIKey) >= 4 {
 			fmt.Printf("  PINATA_API_KEY:    %s***\n", c.PinataAPIKey[:4])

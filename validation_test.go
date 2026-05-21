@@ -30,10 +30,13 @@ func TestValidateCIDRejectsTraversalAndJunk(t *testing.T) {
 
 func TestEmbeddedNodeRejectsTraversalCID(t *testing.T) {
 	tmp := t.TempDir()
-	// gatewayPort "0" tells the OS to assign an ephemeral port. The cap is
-	// arbitrary — every CID under test is rejected at ValidateCID before any
-	// gateway read happens.
-	node, err := NewEmbeddedNode(tmp, "0", 1<<20)
+	// gatewayPort "0" tells the OS to assign an ephemeral port. Every CID
+	// under test is rejected at ValidateCID before any block fetch happens.
+	node, err := NewEmbeddedNode(IPFSNodeOptions{
+		DataDir:      tmp,
+		GatewayPort:  "0",
+		Libp2pListen: []string{"/ip4/127.0.0.1/tcp/0"},
+	})
 	if err != nil {
 		t.Fatalf("NewEmbeddedNode: %v", err)
 	}
@@ -54,15 +57,27 @@ func TestEmbeddedNodeRejectsTraversalCID(t *testing.T) {
 		}
 	}
 
-	// No file should have escaped the blocks dir, and no traversal target
-	// should have landed under tmp.
-	blocks := filepath.Join(tmp, "blocks")
-	entries, err := os.ReadDir(blocks)
-	if err != nil {
-		t.Fatalf("ReadDir(%q): %v", blocks, err)
-	}
-	if len(entries) != 0 {
-		t.Errorf("blocks dir is non-empty after rejected pins: %v", entries)
+	// boxo's flatfs creates a sharded blocks tree under ipfs-repo/blocks.
+	// Walk the whole repo dir and assert nothing CID-shaped landed: every
+	// failing input was rejected at ValidateCID before any block touched
+	// disk.
+	repoDir := filepath.Join(tmp, "ipfs-repo")
+	var stray []string
+	_ = filepath.Walk(repoDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		// Block files use boxo's base32-ish naming; CID-shaped or path-shaped
+		// traversal payload bytes would not appear here.
+		for _, p := range traversalPayloads {
+			if p != "" && strings.Contains(path, p) {
+				stray = append(stray, path)
+			}
+		}
+		return nil
+	})
+	if len(stray) != 0 {
+		t.Errorf("traversal payload(s) landed under repo dir: %v", stray)
 	}
 }
 
