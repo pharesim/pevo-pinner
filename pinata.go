@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -73,7 +74,11 @@ func (p *PinataBackend) Unpin(ctx context.Context, cid string) error {
 	if err := ValidateCID(cid); err != nil {
 		return err
 	}
-	resp, err := p.doRequest(ctx, http.MethodDelete, pinataBaseURL+"/pinning/unpin/"+cid, nil)
+	// Defense-in-depth: escape the CID as a URL path segment. ValidateCID's regex
+	// already excludes path-delimiting characters, so this is additive — it stops
+	// the validator from being load-bearing for URL safety if the regex is ever
+	// relaxed.
+	resp, err := p.doRequest(ctx, http.MethodDelete, pinataBaseURL+"/pinning/unpin/"+url.PathEscape(cid), nil)
 	if err != nil {
 		return fmt.Errorf("pinata unpin request: %w", err)
 	}
@@ -92,8 +97,11 @@ func (p *PinataBackend) IsPinned(ctx context.Context, cid string) (bool, error) 
 	if err := ValidateCID(cid); err != nil {
 		return false, err
 	}
-	url := fmt.Sprintf("%s/data/pinList?status=pinned&hashContains=%s", pinataBaseURL, cid)
-	resp, err := p.doRequest(ctx, http.MethodGet, url, nil)
+	// Defense-in-depth: escape the CID as a URL query value. See the rationale on
+	// Unpin above; the validator already narrows the character class so this is
+	// purely additive at the URL-construction layer.
+	reqURL := fmt.Sprintf("%s/data/pinList?status=pinned&hashContains=%s", pinataBaseURL, url.QueryEscape(cid))
+	resp, err := p.doRequest(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return false, fmt.Errorf("pinata pin check: %w", err)
 	}

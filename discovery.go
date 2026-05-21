@@ -151,6 +151,108 @@ func (d *Discovery) Items() []DiscoveredItem {
 	return cp
 }
 
+// discoveryRow is the in-memory shape of a single HAF result row. Extracted from
+// `refresh()` so the per-row CID-extraction logic (paper / supplementary /
+// inline-image) can be exercised in tests without stubbing `sql.Rows`.
+type discoveryRow struct {
+	Author     string
+	Permlink   string
+	Title      string
+	IpfsCID    string
+	Filename   string
+	Discipline string
+	SuppJSON   string
+	Body       string
+	Created    time.Time
+}
+
+// extractItemsFromRow yields the DiscoveredItems contained in one HAF row,
+// dropping any CID that fails `ValidateCID`. The `seen` map is updated in place
+// so callers can deduplicate across rows. Returns the items kept and the count
+// of CIDs dropped by the validator.
+//
+// The three branches correspond to the three CID entry points the pinner
+// supports: paper PDF CID from `json_metadata.ipfs_cid`, supplementary files
+// from the `supplementary_files` JSON array, and inline-image CIDs scraped from
+// the post body via `ipfsCIDRegex`.
+func extractItemsFromRow(row discoveryRow, seen map[string]bool) (items []DiscoveredItem, dropped int) {
+	// 1. Paper PDF CID
+	if row.IpfsCID != "" && !seen[row.IpfsCID] {
+		if err := ValidateCID(row.IpfsCID); err != nil {
+			dropped++
+			log.Printf("[discovery] dropped invalid paper CID by %s/%s: %v", row.Author, row.Permlink, err)
+		} else {
+			seen[row.IpfsCID] = true
+			items = append(items, DiscoveredItem{
+				Author:     row.Author,
+				Permlink:   row.Permlink,
+				Title:      row.Title,
+				CID:        row.IpfsCID,
+				Filename:   row.Filename,
+				CIDType:    "paper",
+				Discipline: row.Discipline,
+				Created:    row.Created,
+			})
+		}
+	}
+
+	// 2. Supplementary files
+	if row.SuppJSON != "" {
+		var suppFiles []SupplementaryFile
+		if err := json.Unmarshal([]byte(row.SuppJSON), &suppFiles); err == nil {
+			for _, sf := range suppFiles {
+				if sf.CID == "" || seen[sf.CID] {
+					continue
+				}
+				if err := ValidateCID(sf.CID); err != nil {
+					dropped++
+					log.Printf("[discovery] dropped invalid supplementary CID by %s/%s: %v", row.Author, row.Permlink, err)
+					continue
+				}
+				seen[sf.CID] = true
+				items = append(items, DiscoveredItem{
+					Author:     row.Author,
+					Permlink:   row.Permlink,
+					Title:      row.Title,
+					CID:        sf.CID,
+					Filename:   sf.Filename,
+					CIDType:    "supplementary",
+					Discipline: row.Discipline,
+					Created:    row.Created,
+				})
+			}
+		}
+	}
+
+	// 3. Inline images
+	if row.Body != "" {
+		matches := ipfsCIDRegex.FindAllStringSubmatch(row.Body, -1)
+		for _, m := range matches {
+			cid := m[1]
+			if seen[cid] {
+				continue
+			}
+			if err := ValidateCID(cid); err != nil {
+				dropped++
+				log.Printf("[discovery] dropped invalid inline-image CID by %s/%s: %v", row.Author, row.Permlink, err)
+				continue
+			}
+			seen[cid] = true
+			items = append(items, DiscoveredItem{
+				Author:     row.Author,
+				Permlink:   row.Permlink,
+				Title:      row.Title,
+				CID:        cid,
+				CIDType:    "inline_image",
+				Discipline: row.Discipline,
+				Created:    row.Created,
+			})
+		}
+	}
+
+	return items, dropped
+}
+
 func (d *Discovery) refresh(ctx context.Context) error {
 	query := buildDiscoveryQuery(d.appTag)
 	rows, err := d.db.QueryContext(ctx, query)
@@ -178,79 +280,20 @@ func (d *Discovery) refresh(ctx context.Context) error {
 			continue
 		}
 
-		// 1. Paper PDF CID
-		if ipfsCID.Valid && ipfsCID.String != "" && !seen[ipfsCID.String] {
-			if err := ValidateCID(ipfsCID.String); err != nil {
-				dropped++
-				log.Printf("[discovery] dropped invalid paper CID by %s/%s: %v", author, permlink, err)
-			} else {
-				seen[ipfsCID.String] = true
-				items = append(items, DiscoveredItem{
-					Author:     author,
-					Permlink:   permlink,
-					Title:      title,
-					CID:        ipfsCID.String,
-					Filename:   filename.String,
-					CIDType:    "paper",
-					Discipline: discipline.String,
-					Created:    created,
-				})
-			}
-		}
-
-		// 2. Supplementary files
-		if suppJSON.Valid && suppJSON.String != "" {
-			var suppFiles []SupplementaryFile
-			if err := json.Unmarshal([]byte(suppJSON.String), &suppFiles); err == nil {
-				for _, sf := range suppFiles {
-					if sf.CID == "" || seen[sf.CID] {
-						continue
-					}
-					if err := ValidateCID(sf.CID); err != nil {
-						dropped++
-						log.Printf("[discovery] dropped invalid supplementary CID by %s/%s: %v", author, permlink, err)
-						continue
-					}
-					seen[sf.CID] = true
-					items = append(items, DiscoveredItem{
-						Author:     author,
-						Permlink:   permlink,
-						Title:      title,
-						CID:        sf.CID,
-						Filename:   sf.Filename,
-						CIDType:    "supplementary",
-						Discipline: discipline.String,
-						Created:    created,
-					})
-				}
-			}
-		}
-
-		// 3. Inline images
-		if body.Valid {
-			matches := ipfsCIDRegex.FindAllStringSubmatch(body.String, -1)
-			for _, m := range matches {
-				cid := m[1]
-				if seen[cid] {
-					continue
-				}
-				if err := ValidateCID(cid); err != nil {
-					dropped++
-					log.Printf("[discovery] dropped invalid inline-image CID by %s/%s: %v", author, permlink, err)
-					continue
-				}
-				seen[cid] = true
-				items = append(items, DiscoveredItem{
-					Author:     author,
-					Permlink:   permlink,
-					Title:      title,
-					CID:        cid,
-					CIDType:    "inline_image",
-					Discipline: discipline.String,
-					Created:    created,
-				})
-			}
-		}
+		rowItems, rowDropped := extractItemsFromRow(discoveryRow{
+			Author:     author,
+			Permlink:   permlink,
+			Title:      title,
+			IpfsCID:    ipfsCID.String,
+			Filename:   filename.String,
+			Discipline: discipline.String,
+			SuppJSON:   suppJSON.String,
+			Body:       body.String,
+			Created:    created,
+		}, seen)
+		items = append(items, rowItems...)
+		dropped += rowDropped
+		_ = cidType // column is selected for query shape parity; row.CIDType is set per-branch above
 	}
 
 	if err := rows.Err(); err != nil {
