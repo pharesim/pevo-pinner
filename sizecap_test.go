@@ -66,7 +66,7 @@ func TestEmbeddedNodePinRejectsOversizedGatewayResponse(t *testing.T) {
 func TestEmbeddedNodePinAcceptsUnderCapResponse(t *testing.T) {
 	const cap = int64(1024)
 
-	// Use a content/CID pair so hash verification (added after this task)
+	// Use a content/CID pair so the hash-verify path in EmbeddedNode.Pin
 	// also passes — this test proves the size-cap accept path doesn't
 	// inadvertently clamp legitimate content.
 	body := []byte(strings.Repeat("B", 100)) // well under cap

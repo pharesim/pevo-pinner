@@ -71,7 +71,7 @@ Environment variables (CLI flags override):
   PORT                 Management UI port (default: 8421)
   GATEWAY_PORT         IPFS gateway port (default: 8080)
   REFRESH_INTERVAL     Re-query interval (default: 1h)
-  PINNER_MAX_PIN_BYTES Max bytes per gateway fetch (default: 268435456 = 256 MiB)
+  MAX_PIN_BYTES        Max bytes per gateway fetch (default: 268435456 = 256 MiB)
 `)
 		return nil, fmt.Errorf("HAF_DATABASE_URL is required")
 	}
@@ -104,13 +104,13 @@ Environment variables (CLI flags override):
 	cfg.RefreshInterval = dur
 
 	// Max pin bytes
-	maxStr := envOrFlag("PINNER_MAX_PIN_BYTES", *maxPinBytes, "")
+	maxStr := envOrFlag("MAX_PIN_BYTES", *maxPinBytes, "")
 	if maxStr == "" {
 		cfg.MaxPinBytes = defaultMaxPinBytes
 	} else {
 		n, err := strconv.ParseInt(maxStr, 10, 64)
 		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("invalid PINNER_MAX_PIN_BYTES %q: must be a positive integer (bytes)", maxStr)
+			return nil, fmt.Errorf("invalid MAX_PIN_BYTES %q: must be a positive integer (bytes)", maxStr)
 		}
 		cfg.MaxPinBytes = n
 	}
