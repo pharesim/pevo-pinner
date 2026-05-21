@@ -27,6 +27,7 @@ var publicGateways = []string{
 type EmbeddedNode struct {
 	dataDir     string
 	gatewayPort string
+	maxPinBytes int64
 
 	mu      sync.RWMutex
 	pins    map[string]bool // CID -> pinned
@@ -36,7 +37,8 @@ type EmbeddedNode struct {
 }
 
 // NewEmbeddedNode creates an embedded IPFS node with local storage.
-func NewEmbeddedNode(dataDir, gatewayPort string) (*EmbeddedNode, error) {
+// maxPinBytes caps how much can be copied from any single gateway response.
+func NewEmbeddedNode(dataDir, gatewayPort string, maxPinBytes int64) (*EmbeddedNode, error) {
 	blocksDir := filepath.Join(dataDir, "blocks")
 	if err := os.MkdirAll(blocksDir, 0o755); err != nil {
 		return nil, fmt.Errorf("creating blocks dir: %w", err)
@@ -45,6 +47,7 @@ func NewEmbeddedNode(dataDir, gatewayPort string) (*EmbeddedNode, error) {
 	node := &EmbeddedNode{
 		dataDir:     dataDir,
 		gatewayPort: gatewayPort,
+		maxPinBytes: maxPinBytes,
 		pins:        make(map[string]bool),
 		pinFile:     filepath.Join(dataDir, "pins.json"),
 		client: &http.Client{
@@ -129,12 +132,20 @@ func (n *EmbeddedNode) Pin(ctx context.Context, cid string) error {
 			return fmt.Errorf("creating block file: %w", err)
 		}
 
-		_, err = io.Copy(f, resp.Body)
+		// Cap the read at maxPinBytes. Read one extra byte: if N reaches 0
+		// after the copy, the gateway tried to give us more than the cap.
+		lr := &io.LimitedReader{R: resp.Body, N: n.maxPinBytes + 1}
+		_, err = io.Copy(f, lr)
 		resp.Body.Close()
 		f.Close()
 		if err != nil {
 			os.Remove(path)
 			lastErr = fmt.Errorf("writing block: %w", err)
+			continue
+		}
+		if lr.N == 0 {
+			os.Remove(path)
+			lastErr = fmt.Errorf("gateway %s response exceeded size cap of %d bytes", gw, n.maxPinBytes)
 			continue
 		}
 

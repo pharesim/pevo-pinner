@@ -30,8 +30,10 @@ func TestValidateCIDRejectsTraversalAndJunk(t *testing.T) {
 
 func TestEmbeddedNodeRejectsTraversalCID(t *testing.T) {
 	tmp := t.TempDir()
-	// gatewayPort "0" tells the OS to assign an ephemeral port.
-	node, err := NewEmbeddedNode(tmp, "0")
+	// gatewayPort "0" tells the OS to assign an ephemeral port. The cap is
+	// arbitrary — every CID under test is rejected at ValidateCID before any
+	// gateway read happens.
+	node, err := NewEmbeddedNode(tmp, "0", 1<<20)
 	if err != nil {
 		t.Fatalf("NewEmbeddedNode: %v", err)
 	}

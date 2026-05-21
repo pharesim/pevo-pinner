@@ -42,7 +42,7 @@ func main() {
 	var backend IPFSBackend
 	switch cfg.IPFSMode {
 	case "embedded":
-		backend, err = NewEmbeddedNode(cfg.DataDir, cfg.GatewayPort)
+		backend, err = NewEmbeddedNode(cfg.DataDir, cfg.GatewayPort, cfg.MaxPinBytes)
 		if err != nil {
 			log.Fatalf("initializing embedded IPFS node: %v", err)
 		}
