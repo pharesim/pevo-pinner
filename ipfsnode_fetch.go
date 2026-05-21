@@ -47,12 +47,18 @@ func newBitswap(ctx context.Context, h host.Host, dht routing.Routing, bs bsbloc
 // must match the digest of the block bytes), then written to the blockstore.
 // Returns nil on the first success, or a joined error if every gateway in
 // the chain fails.
+//
+// The chain order is: PEvO main → operator-supplied FALLBACK_GATEWAYS →
+// mesh-discovered pinners' gateway URLs → public defaults. Mesh entries are
+// recomputed per-call (the cache lives behind meshManager) so newly-online
+// pinners can be tried mid-session without restart.
 func (n *EmbeddedNode) fetchViaCAR(ctx context.Context, c cid.Cid) error {
-	if len(n.fallbackGateways) == 0 {
+	chain := n.assembleFallbackChain()
+	if len(chain) == 0 {
 		return errors.New("no fallback gateways configured")
 	}
 	var errs []error
-	for _, gw := range n.fallbackGateways {
+	for _, gw := range chain {
 		if err := n.fetchCARFromGateway(ctx, gw, c); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", gw, err))
 			log.Printf("[ipfs] CAR fallback %s failed: %v", gw, err)
@@ -62,6 +68,64 @@ func (n *EmbeddedNode) fetchViaCAR(ctx context.Context, c cid.Cid) error {
 		return nil
 	}
 	return fmt.Errorf("all CAR-fetch gateways failed: %w", errors.Join(errs...))
+}
+
+// assembleFallbackChain merges the static configured chain with any
+// mesh-discovered pinner gateway URLs. Mesh entries are inserted between
+// the operator-supplied FALLBACK_GATEWAYS and the public defaults, so the
+// declared order remains: PEvO main → operator extras → mesh → public.
+func (n *EmbeddedNode) assembleFallbackChain() []string {
+	if n.mesh == nil {
+		return n.fallbackGateways
+	}
+	peers := n.mesh.KnownPeers()
+	if len(peers) == 0 {
+		return n.fallbackGateways
+	}
+	// Find the boundary between the static (PEvO + operator) head and the
+	// public-default tail of fallbackGateways so mesh URLs can be spliced
+	// in. The default set lives at the tail (NewEmbeddedNode composes the
+	// chain that way); compare against defaultFallbackGateways to find it.
+	headEnd := len(n.fallbackGateways)
+	for i := range n.fallbackGateways {
+		if i+len(defaultFallbackGateways) > len(n.fallbackGateways) {
+			break
+		}
+		match := true
+		for j, def := range defaultFallbackGateways {
+			if n.fallbackGateways[i+j] != def {
+				match = false
+				break
+			}
+		}
+		if match {
+			headEnd = i
+			break
+		}
+	}
+
+	seen := make(map[string]struct{}, len(n.fallbackGateways)+len(peers))
+	out := make([]string, 0, len(n.fallbackGateways)+len(peers))
+	add := func(u string) {
+		if u == "" {
+			return
+		}
+		if _, ok := seen[u]; ok {
+			return
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
+	}
+	for _, u := range n.fallbackGateways[:headEnd] {
+		add(u)
+	}
+	for _, p := range peers {
+		add(p.gatewayURL)
+	}
+	for _, u := range n.fallbackGateways[headEnd:] {
+		add(u)
+	}
+	return out
 }
 
 // fetchCARFromGateway streams a trustless CAR response from gw and writes

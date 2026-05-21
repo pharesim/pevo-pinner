@@ -43,13 +43,18 @@ func main() {
 	switch cfg.IPFSMode {
 	case "embedded":
 		backend, err = NewEmbeddedNode(IPFSNodeOptions{
-			DataDir:            cfg.DataDir,
-			GatewayPort:        cfg.GatewayPort,
-			Libp2pListen:       cfg.Libp2pListen,
-			PEvOMainLibp2pAddr: cfg.PEvOMainLibp2pAddr,
-			PEvOMainGatewayURL: cfg.PEvOMainGatewayURL,
-			FallbackGateways:   cfg.FallbackGateways,
-			BitswapTimeout:     cfg.BitswapTimeout,
+			DataDir:               cfg.DataDir,
+			GatewayPort:           cfg.GatewayPort,
+			Libp2pListen:          cfg.Libp2pListen,
+			PEvOMainLibp2pAddr:    cfg.PEvOMainLibp2pAddr,
+			PEvOMainGatewayURL:    cfg.PEvOMainGatewayURL,
+			FallbackGateways:      cfg.FallbackGateways,
+			BitswapTimeout:        cfg.BitswapTimeout,
+			MeshAppTag:            cfg.AppTag,
+			MeshPublicGatewayURL:  cfg.MeshPublicGatewayURL,
+			MeshHeartbeatInterval: cfg.MeshHeartbeatInterval,
+			MeshCacheTTL:          cfg.MeshCacheTTL,
+			MeshAdvertiseDisabled: cfg.MeshAdvertiseDisabled,
 		})
 		if err != nil {
 			log.Fatalf("initializing embedded IPFS node: %v", err)

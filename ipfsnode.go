@@ -63,9 +63,14 @@ type EmbeddedNode struct {
 	// fallback chain runs in order: fallbackGateways (PEvO main first if
 	// configured via the IPFSNodeOptions PEvOMainGatewayURL knob, then any
 	// operator-supplied FALLBACK_GATEWAYS, then defaultFallbackGateways).
+	// The mesh layer (if enabled) appends discovered pinners' gateway URLs
+	// to a per-Pin chain via meshGatewayURLs.
 	bitswapTimeout   time.Duration
 	fallbackGateways []string
 	httpClient       *http.Client
+
+	// Community pinner mesh. nil when MeshAppTag was empty.
+	mesh *meshManager
 
 	// Drain coordination. drainMu serializes the gate check + WaitGroup.Add
 	// in Pin with the close + Wait in Drain. done is closed exactly once via
@@ -106,6 +111,17 @@ type IPFSNodeOptions struct {
 	// Operator-supplied additional CAR-fetch gateway URLs. Inserted into
 	// the chain after PEvO main, before the default public gateways.
 	FallbackGateways []string
+
+	// Community pinner mesh (libp2p pubsub) knobs. AppTag enables the mesh
+	// (typically the same APP_TAG used by HAF discovery). PublicGatewayURL
+	// is what other pinners learn from our heartbeats so they can chain
+	// us into their CAR-fetch fallback list — leave empty if the pinner's
+	// gateway port is not reachable from the public internet.
+	MeshAppTag            string
+	MeshPublicGatewayURL  string
+	MeshHeartbeatInterval time.Duration
+	MeshCacheTTL          time.Duration
+	MeshAdvertiseDisabled bool
 }
 
 // defaultBitswapTimeout: brainstorm-stated default. Tunable via BITSWAP_TIMEOUT.
@@ -192,6 +208,22 @@ func NewEmbeddedNode(opts IPFSNodeOptions) (*EmbeddedNode, error) {
 	if err := node.startGateway(); err != nil {
 		_ = node.shutdownInternals()
 		return nil, fmt.Errorf("starting gateway: %w", err)
+	}
+
+	// Community pinner mesh is opt-in via MeshAppTag — empty tag = mesh off.
+	if opts.MeshAppTag != "" {
+		mesh, err := startMesh(ctx, h, MeshOptions{
+			AppTag:       opts.MeshAppTag,
+			GatewayURL:   opts.MeshPublicGatewayURL,
+			Interval:     opts.MeshHeartbeatInterval,
+			CacheTTL:     opts.MeshCacheTTL,
+			AdvertiseOff: opts.MeshAdvertiseDisabled,
+		}, nil, nil)
+		if err != nil {
+			log.Printf("[ipfs] mesh disabled: %v", err)
+		} else {
+			node.mesh = mesh
+		}
 	}
 
 	log.Printf("[ipfs] libp2p host started: %s", h.ID())
@@ -377,6 +409,9 @@ func (n *EmbeddedNode) Close() error {
 
 func (n *EmbeddedNode) shutdownInternals() error {
 	var firstErr error
+	if n.mesh != nil {
+		n.mesh.Stop()
+	}
 	if closer, ok := n.bitswap.(interface{ Close() error }); ok && closer != nil {
 		if err := closer.Close(); err != nil && firstErr == nil {
 			firstErr = err

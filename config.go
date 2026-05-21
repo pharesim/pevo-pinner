@@ -39,6 +39,14 @@ type Config struct {
 	PEvOMainGatewayURL string
 	FallbackGateways   []string
 	BitswapTimeout     time.Duration
+
+	// Community pinner mesh knobs. Cadence and TTL govern heartbeat and
+	// known-peers eviction; MeshAdvertiseDisabled flips the pinner to
+	// subscribe-only (still consumes the mesh, no publish).
+	MeshPublicGatewayURL  string
+	MeshHeartbeatInterval time.Duration
+	MeshCacheTTL          time.Duration
+	MeshAdvertiseDisabled bool
 }
 
 func ParseConfig() (*Config, error) {
@@ -62,6 +70,10 @@ func ParseConfig() (*Config, error) {
 	pevoMainGateway := flag.String("pevo-main-gateway-url", "", "PEvO main HTTP gateway URL (first CAR-fetch fallback entry); empty = no PEvO-main entry")
 	fallbackGw := flag.String("fallback-gateways", "", "Comma-separated extra CAR-fetch gateway URLs (inserted before the public defaults)")
 	bitswapTimeout := flag.String("bitswap-timeout", "", "Per-Pin bitswap fetch timeout (default 60s)")
+	meshGateway := flag.String("mesh-public-gateway-url", "", "Public HTTP gateway URL advertised on the mesh (empty = don't share)")
+	meshInterval := flag.String("mesh-heartbeat-interval", "", "Mesh heartbeat cadence (default 30s)")
+	meshTTL := flag.String("mesh-cache-ttl", "", "Mesh known-peers TTL (default 5m)")
+	meshAdvOff := flag.Bool("mesh-advertise-disabled", false, "Suppress mesh heartbeat publish (subscribe-only)")
 
 	flag.Parse()
 
@@ -97,6 +109,10 @@ Environment variables (CLI flags override):
   PEVO_MAIN_GATEWAY_URL  PEvO main HTTP gateway URL for CAR fallback (default: empty)
   FALLBACK_GATEWAYS    Comma-separated extra CAR-fetch gateways
   BITSWAP_TIMEOUT      Per-Pin bitswap timeout duration (default: 60s)
+  MESH_PUBLIC_GATEWAY_URL  Gateway URL advertised on the mesh (default: empty)
+  MESH_HEARTBEAT_INTERVAL  Mesh heartbeat cadence (default: 30s)
+  MESH_CACHE_TTL       Mesh known-peers TTL (default: 5m)
+  MESH_ADVERTISE_DISABLED  Subscribe-only mode (default: false)
 `)
 		return nil, fmt.Errorf("HAF_DATABASE_URL is required")
 	}
@@ -183,6 +199,35 @@ Environment variables (CLI flags override):
 			return nil, fmt.Errorf("invalid BITSWAP_TIMEOUT %q: %w", bswStr, err)
 		}
 		cfg.BitswapTimeout = d
+	}
+
+	// Mesh knobs
+	cfg.MeshPublicGatewayURL = envOrFlag("MESH_PUBLIC_GATEWAY_URL", *meshGateway, "")
+	if s := envOrFlag("MESH_HEARTBEAT_INTERVAL", *meshInterval, ""); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("invalid MESH_HEARTBEAT_INTERVAL %q: %w", s, err)
+		}
+		cfg.MeshHeartbeatInterval = d
+	}
+	if s := envOrFlag("MESH_CACHE_TTL", *meshTTL, ""); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil || d <= 0 {
+			return nil, fmt.Errorf("invalid MESH_CACHE_TTL %q: %w", s, err)
+		}
+		cfg.MeshCacheTTL = d
+	}
+	// MESH_ADVERTISE_DISABLED bool: any truthy env value (1/true/yes) flips
+	// the pinner to subscribe-only. The flag default is false; the env var
+	// overrides only when explicitly set, matching the rest of the config
+	// surface.
+	if v := os.Getenv("MESH_ADVERTISE_DISABLED"); v != "" {
+		switch strings.ToLower(v) {
+		case "1", "true", "yes", "on":
+			cfg.MeshAdvertiseDisabled = true
+		}
+	} else if *meshAdvOff {
+		cfg.MeshAdvertiseDisabled = true
 	}
 
 	// Validate mode
